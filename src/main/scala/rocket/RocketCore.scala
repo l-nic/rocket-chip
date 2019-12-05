@@ -265,6 +265,10 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val id_sfence = id_ctrl.mem && id_ctrl.mem_cmd === M_SFENCE
   val id_csr_flush = id_sfence || id_system_insn || (id_csr_en && !id_csr_ren && csr.io.decode(0).write_flush)
 
+  if (usingLNIC) {
+    csr.io.net.get <> io.net.get
+  }
+
   val id_scie_decoder = if (!rocketParams.useSCIE) Wire(new SCIEDecoderInterface) else {
     val d = Module(new SCIEDecoder)
     assert(PopCount(d.io.unpipelined :: d.io.pipelined :: d.io.multicycle :: Nil) <= 1)

@@ -337,6 +337,13 @@ object CSRs {
   val fflags = 0x1
   val frm = 0x2
   val fcsr = 0x3
+
+  // LNIC CSRs
+  val lmsgsrdy = 0x052
+  val lread = 0x051
+  val lwrite = 0x057
+  val lwrend = 0x058
+  
   val cycle = 0xc00
   val time = 0xc01
   val instret = 0xc02

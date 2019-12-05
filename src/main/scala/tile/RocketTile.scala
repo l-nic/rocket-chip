@@ -39,6 +39,7 @@ class RocketTile private(
     extends BaseTile(rocketParams, crossing, lookup, q)
     with SinksExternalInterrupts
     with SourcesExternalNotifications
+    with CanHaveLNIC
     with HasLazyRoCC  // implies CanHaveSharedFPU with CanHavePTW with HasHellaCache
     with HasHellaCache
     with HasICacheFrontend
@@ -115,6 +116,7 @@ class RocketTile private(
 
 class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
     with HasFpuOpt
+    with CanHaveLNICModule
     with HasLazyRoCCModule
     with HasICacheFrontendModule {
   Annotated.params(this, outer.rocketParams)
