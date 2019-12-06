@@ -557,6 +557,12 @@ object CSRs {
     res += fflags
     res += frm
     res += fcsr
+
+    res += lmsgsrdy
+    res += lread
+    res += lwrite
+    res += lwrend
+    
     res += cycle
     res += time
     res += instret

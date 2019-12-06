@@ -124,10 +124,9 @@ object CSR
   def S = UInt(6,SZ)
   def C = UInt(7,SZ)
 
-  // mask a CSR cmd with a valid bit
+  // mask a CSR cmd to 0 based on a valid bit
   def maskCmd(valid: Bool, cmd: UInt): UInt = {
-    // all commands less than CSR.I are treated by CSRFile as NOPs
-    cmd & ~Mux(valid, 0.U, CSR.I)
+    cmd & ~Mux(valid, 0.U, CSR.C)
   }
 
   val ADDRSZ = 12
@@ -221,7 +220,7 @@ class CSRFileIO(implicit p: Parameters) extends CoreBundle
   val csrw_counter = UInt(OUTPUT, CSR.nCtr)
   val inst = Vec(retireWidth, UInt(width = iLen)).asInput
   val trace = Vec(retireWidth, new TracedInstruction).asOutput
-  val net = if (usingLNIC) Some(new LNICCoreIO().flip) else None
+  val net = if (usingLNIC) Some(new LNICCoreIO()) else None
 }
 
 class CSRFile(
@@ -338,7 +337,7 @@ class CSRFile(
   // Define LNIC CSRs, Rx/Tx queues, and additional wires
   val reg_lmsgsrdy = if (usingLNIC) Some(Reg(init = 0.asUInt(64.W))) else None
   val reg_lwrend = if (usingLNIC) Some(Reg(init = 0.asUInt(64.W))) else None
-  val txQueue_in = if (usingLNIC) Some(Decoupled(new StreamChannel(64))) else None
+  val txQueue_in = if (usingLNIC) Some(Wire(Decoupled(new StreamChannel(64)))) else None
   val rxQueue_out = if (usingLNIC) Some(Queue(io.net.get.in, p(LNICKey).inBufFlits)) else None
 
   if (usingLNIC) {
@@ -485,6 +484,8 @@ class CSRFile(
   if (usingLNIC) {
     read_mapping += CSRs.lread -> rxQueue_out.get.bits.data
     read_mapping += CSRs.lmsgsrdy -> reg_lmsgsrdy.get
+    read_mapping += CSRs.lwrite -> 0.U
+    read_mapping += CSRs.lwrend -> reg_lwrend.get
   }
 
   val pmpCfgPerCSR = xLen / new PMPConfig().getWidth
@@ -718,9 +719,15 @@ class CSRFile(
     txQueue_in.get.bits.last := 0.U
 
     // LNIC CSR read update logic
-    val csr_ren = io.rw.cmd.isOneOf(CSR.S, CSR.C, CSR.W)
+    val csr_ren = io.rw.cmd.isOneOf(CSR.R, CSR.I, CSR.W, CSR.S, CSR.C)
+    dontTouch(csr_ren)
+    csr_ren.suggestName("csr_ren")
+    val read_csr_lread = decoded_addr(CSRs.lread)
+    dontTouch(read_csr_lread)
+    read_csr_lread.suggestName("read_csr_lread")
+
     val dec_lmsgsrdy = Wire(Bool())
-    when (csr_ren && decoded_addr(CSRs.lread)) {
+    when (csr_ren && read_csr_lread) {
       // read from rxQueue
       rxQueue_out.get.ready := true.B
       // decrement lmsgsrdy CSR when the last word of a msg is read from the rxQueue
@@ -768,7 +775,7 @@ class CSRFile(
       when (decoded_addr(CSRs.lwrite)) {
         txQueue_in.get.valid := true.B
         txQueue_in.get.bits.data := wdata
-        txQueue_in.get.bits.keep := ~0.U // TODO(sibanez): how to deal with non 64-bit aligned msgs?
+        txQueue_in.get.bits.keep := LNICConsts.NET_FULL_KEEP // TODO(sibanez): how to deal with non 64-bit aligned msgs?
         txQueue_in.get.bits.last := (reg_lwrend.get > 0.U)
         // TODO(sibanez): what to do when txQueue is full (i.e. !txQueue_in.ready)
         // That will only happen if the NIC is unable to keep up with the CPU

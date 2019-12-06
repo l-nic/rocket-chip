@@ -23,7 +23,7 @@ object LNICConsts {
 
   val IPV4_HEAD_BYTES = 20
 
-  def NET_FULL_KEEP = ~0.U(NET_IF_BYTES.W)
+  def NET_FULL_KEEP = ~0.U(NET_IF_BYTES.W) // 0xFF.U
   def ETH_BCAST_MAC = ~0.U(ETH_MAC_BITS.W)
 }
 
@@ -78,7 +78,7 @@ class LNICNetIO extends StreamIO(LNICConsts.NET_IF_WIDTH) {
  */
 class LNICIO(implicit p: Parameters) extends CoreBundle()(p) {
   val core = new LNICCoreIO()
-  val net = new LNICNetIO().flip
+  val net = new LNICNetIO()
 }
 
 /**
@@ -106,10 +106,14 @@ trait CanHaveLNIC { this: RocketTile =>
 
 trait CanHaveLNICModule { this: RocketTileModuleImp =>
   val net = if (usingLNIC) Some(IO(new LNICNetIO)) else None
-  if (usingLNIC) {
-    // Connect network IO to LNIC module and LNIC module to RocketCore
+  def connectLNIC() {
+    require(net.isDefined, "[CanHaveLNICModule] net is not defined.")
+    require(outer.lnic.isDefined, "[CanHaveLNICModule] outer.lnic is not defined.")
+    require(core.io.net.isDefined, "[CanHaveLNICModule] core.io.net is not defined.")
+    // Connect network IO to LNIC module
     net.get <> outer.lnic.get.module.io.net
-    outer.lnic.get.module.io.core <> core.io.net.get
+    // Connect LNIC module to RocketCore
+    core.io.net.get <> outer.lnic.get.module.io.core
   }
 }
 
@@ -118,7 +122,6 @@ trait CanHaveLNICModule { this: RocketTileModuleImp =>
 trait HasLNIC { this: RocketSubsystem =>
   val lnicTiles = tiles
 }
-
 
 trait HasLNICModuleImp extends LazyModuleImp with HasTileParameters {
   val outer: HasLNIC
