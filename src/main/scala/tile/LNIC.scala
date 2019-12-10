@@ -23,8 +23,11 @@ object LNICConsts {
 
   val IPV4_HEAD_BYTES = 20
 
-  def NET_FULL_KEEP = ~0.U(NET_IF_BYTES.W) // 0xFF.U
+  def NET_FULL_KEEP = ~0.U(NET_IF_BYTES.W)
   def ETH_BCAST_MAC = ~0.U(ETH_MAC_BITS.W)
+
+  val LWRITE_ADDR = 31.U
+  val LREAD_ADDR = 30.U
 }
 
 case class LNICParams(
@@ -113,7 +116,8 @@ trait CanHaveLNICModule { this: RocketTileModuleImp =>
     // Connect network IO to LNIC module
     net.get <> outer.lnic.get.module.io.net
     // Connect LNIC module to RocketCore
-    core.io.net.get <> outer.lnic.get.module.io.core
+    core.io.net.get.in <> outer.lnic.get.module.io.core.out
+    outer.lnic.get.module.io.core.in <> core.io.net.get.out
   }
 }
 
@@ -142,5 +146,71 @@ trait HasLNICModuleImp extends LazyModuleImp with HasTileParameters {
       net.in <> Queue(LatencyPipe(net.out, latency), qDepth)
     }
   }
+
+  def connectPktGen() {
+    netPorts.foreach { net =>
+      val pktGen = Module(new PktGen)
+      pktGen.io.net.in <> net.out
+      net.in <> pktGen.io.net.out
+    }
+  }
+
 }
+
+/* Test Modules */
+
+class PktGen extends Module {
+  val io = IO(new Bundle {
+    val net = new LNICNetIO
+  })
+
+  /* A simple module that generates a 4 word pkt once every 100 cycles */
+
+  val pktDelay = RegInit(0.U(64.W))
+  val wordCnt = RegInit(0.U(64.W))
+
+  val sWaitStart :: sWriteWords :: sWaitResp :: Nil = Enum(3)
+  val state = RegInit(sWaitStart)
+
+  // default io
+  io.net.in.ready := true.B
+  io.net.out.valid := false.B
+  io.net.out.bits.data := 0.U
+  io.net.out.bits.keep := LNICConsts.NET_FULL_KEEP
+  io.net.out.bits.last := 0.U
+
+  switch (state) {
+    is (sWaitStart) {
+      when (pktDelay >= 100.U) {
+        state := sWriteWords
+        pktDelay := 0.U
+      }.otherwise {
+        pktDelay := pktDelay + 1.U
+      }
+    }
+    is (sWriteWords) {
+      // drive outputs
+      io.net.out.valid := true.B
+      when (wordCnt === 3.U) {
+        io.net.out.bits.last := true.B
+      }
+      io.net.out.bits.data := wordCnt
+      // next state logic
+      when (wordCnt === 3.U && io.net.out.ready) {
+        state := sWaitResp
+        wordCnt := 0.U
+      } .otherwise {
+        wordCnt := wordCnt + 1.U
+      }
+    }
+    is (sWaitResp) {
+      when (io.net.in.valid) {
+        state := sWaitStart
+      }
+    }
+  }
+
+
+}
+
 

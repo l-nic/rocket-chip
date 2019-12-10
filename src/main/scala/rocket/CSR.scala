@@ -181,6 +181,14 @@ class CSRDecodeIO extends Bundle {
   val system_illegal = Bool(OUTPUT)
 }
 
+class CSRTxCmd extends Bundle {
+  val cmd = Flipped(Decoupled(UInt(64)))
+}
+
+class CSRRxCmd extends Bundle {
+  val cmd = Decoupled(UInt(64))
+}
+
 class CSRFileIO(implicit p: Parameters) extends CoreBundle
     with HasCoreParameters {
   val ungated_clock = Clock().asInput
@@ -221,6 +229,10 @@ class CSRFileIO(implicit p: Parameters) extends CoreBundle
   val inst = Vec(retireWidth, UInt(width = iLen)).asInput
   val trace = Vec(retireWidth, new TracedInstruction).asOutput
   val net = if (usingLNIC) Some(new LNICCoreIO()) else None
+  // RegFile tells CSRFile when to enq data into txQueue
+  val tx = if (usingLNIC) Some(new CSRTxCmd) else None
+  // RegFile tells CSRFile when to deq data from rxQueue
+  val rx = if (usingLNIC) Some(new CSRRxCmd) else None
 }
 
 class CSRFile(
@@ -335,13 +347,25 @@ class CSRFile(
   val reg_frm = Reg(UInt(width = 3))
 
   // Define LNIC CSRs, Rx/Tx queues, and additional wires
-  val reg_lmsgsrdy = if (usingLNIC) Some(Reg(init = 0.asUInt(64.W))) else None
-  val reg_lwrend = if (usingLNIC) Some(Reg(init = 0.asUInt(64.W))) else None
-  val txQueue_in = if (usingLNIC) Some(Wire(Decoupled(new StreamChannel(64)))) else None
+  val reg_lmsgsrdy = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
+  val reg_lwrend = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
+  val txQueue_in = if (usingLNIC) Some(Wire(Decoupled(new StreamChannel(xLen)))) else None
   val rxQueue_out = if (usingLNIC) Some(Queue(io.net.get.in, p(LNICKey).inBufFlits)) else None
 
   if (usingLNIC) {
+    /* Wire up txQueue */
+    io.tx.get.cmd.ready := txQueue_in.get.ready
+    txQueue_in.get.valid := io.tx.get.cmd.valid
+    txQueue_in.get.bits.data := io.tx.get.cmd.bits
+    txQueue_in.get.bits.keep := LNICConsts.NET_FULL_KEEP // TODO(sibanez): How to handle non 64-bit aligned msgs?
+    txQueue_in.get.bits.last := (reg_lwrend.get > 0.U)
+    // Connect txQueue output to network io output
     io.net.get.out := Queue(txQueue_in.get, p(LNICKey).outBufFlits)
+
+    /* Wire up rxQueue */
+    rxQueue_out.get.ready := io.rx.get.cmd.ready
+    io.rx.get.cmd.valid := rxQueue_out.get.valid
+    io.rx.get.cmd.bits := rxQueue_out.get.bits.data
   }
 
   val reg_instret = WideCounter(64, io.retire)
@@ -482,9 +506,7 @@ class CSRFile(
   }
 
   if (usingLNIC) {
-    read_mapping += CSRs.lread -> rxQueue_out.get.bits.data
     read_mapping += CSRs.lmsgsrdy -> reg_lmsgsrdy.get
-    read_mapping += CSRs.lwrite -> 0.U
     read_mapping += CSRs.lwrend -> reg_lwrend.get
   }
 
@@ -711,29 +733,17 @@ class CSRFile(
     set_fs_dirty := true
   }
 
+  val csr_wen = io.rw.cmd.isOneOf(CSR.S, CSR.C, CSR.W)
+
   if (usingLNIC) {
-    // Set txQueue_in defaults
-    txQueue_in.get.valid := false.B
-    txQueue_in.get.bits.data := 0.U
-    txQueue_in.get.bits.keep := 0.U
-    txQueue_in.get.bits.last := 0.U
-
-    // LNIC CSR read update logic
-    val csr_ren = io.rw.cmd.isOneOf(CSR.R, CSR.I, CSR.W, CSR.S, CSR.C)
-    dontTouch(csr_ren)
-    csr_ren.suggestName("csr_ren")
-    val read_csr_lread = decoded_addr(CSRs.lread)
-    dontTouch(read_csr_lread)
-    read_csr_lread.suggestName("read_csr_lread")
-
+    /* LNIC lmsgsrdy CSR update logic */
     val dec_lmsgsrdy = Wire(Bool())
-    when (csr_ren && read_csr_lread) {
-      // read from rxQueue
-      rxQueue_out.get.ready := true.B
+    val inc_lmsgsrdy = Wire(Bool())
+
+    when (rxQueue_out.get.ready) {
       // decrement lmsgsrdy CSR when the last word of a msg is read from the rxQueue
       dec_lmsgsrdy := rxQueue_out.get.bits.last
     }.otherwise {
-      rxQueue_out.get.ready := false.B
       dec_lmsgsrdy := false.B
     }
 
@@ -741,7 +751,6 @@ class CSRFile(
     val sWaitFirstWord :: sWaitLastWord :: Nil = Enum(2)
     val msgState = RegInit(sWaitFirstWord)
 
-    val inc_lmsgsrdy = Wire(Bool())
     inc_lmsgsrdy := ((msgState === sWaitFirstWord) && io.net.get.in.valid && io.net.get.in.ready)
 
     switch (msgState) {
@@ -761,35 +770,30 @@ class CSRFile(
     // lmsgsrdy should be incremented when the first word of a msg arrives at the rxQueue
     // and decremented when the last word of a msg is read from rxQueue
     when (inc_lmsgsrdy && !dec_lmsgsrdy) {
-      reg_lmsgsrdy.get := reg_lmsgsrdy.get + 1.U
+      // prevent overflow
+      when (reg_lmsgsrdy.get < ~0.U(xLen.W)) {
+        reg_lmsgsrdy.get := reg_lmsgsrdy.get + 1.U
+      }
     }.elsewhen (!inc_lmsgsrdy && dec_lmsgsrdy) {
-      reg_lmsgsrdy.get := reg_lmsgsrdy.get - 1.U
+      // prevent underflow
+      when (reg_lmsgsrdy.get > 0) {
+        reg_lmsgsrdy.get := reg_lmsgsrdy.get - 1.U
+      }
+    }
+
+    // Update lwrend CSR
+    when (csr_wen && decoded_addr(CSRs.lwrend)) {
+      // update lwrend with CPU provided value
+      reg_lwrend.get := wdata
+    }.elsewhen (txQueue_in.get.valid && reg_lwrend.get > 0.U) {
+      // Clear lwrend CSR when writing the last word to the txQueue.
+      // This is so that the CPU only has to set lwrend before writing the last word of each msg.
+      reg_lwrend.get := 0.U
     }
   }
 
-  val csr_wen = io.rw.cmd.isOneOf(CSR.S, CSR.C, CSR.W)
   io.csrw_counter := Mux(coreParams.haveBasicCounters && csr_wen && (io.rw.addr.inRange(CSRs.mcycle, CSRs.mcycle + CSR.nCtr) || io.rw.addr.inRange(CSRs.mcycleh, CSRs.mcycleh + CSR.nCtr)), UIntToOH(io.rw.addr(log2Ceil(CSR.nCtr+nPerfCounters)-1, 0)), 0.U)
   when (csr_wen) {
-    if (usingLNIC) {
-      // LNIC CSR write logic
-      when (decoded_addr(CSRs.lwrite)) {
-        txQueue_in.get.valid := true.B
-        txQueue_in.get.bits.data := wdata
-        txQueue_in.get.bits.keep := LNICConsts.NET_FULL_KEEP // TODO(sibanez): how to deal with non 64-bit aligned msgs?
-        txQueue_in.get.bits.last := (reg_lwrend.get > 0.U)
-        // TODO(sibanez): what to do when txQueue is full (i.e. !txQueue_in.ready)
-        // That will only happen if the NIC is unable to keep up with the CPU
-
-        // Clear lwrend CSR when writing the last word to the txQueue.
-        // This is so that the CPU only has to set lwrend before writing the last word of each msg.
-        when (reg_lwrend.get > 0.U) {
-          reg_lwrend.get := 0.U
-        }
-      }
-      when (decoded_addr(CSRs.lwrend)) {
-        reg_lwrend.get := wdata
-      }
-    }
     when (decoded_addr(CSRs.mstatus)) {
       val new_mstatus = new MStatus().fromBits(wdata)
       reg_mstatus.mie := new_mstatus.mie

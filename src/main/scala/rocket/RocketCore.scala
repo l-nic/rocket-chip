@@ -253,21 +253,34 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val id_ren = IndexedSeq(id_ctrl.rxs1, id_ctrl.rxs2)
   val id_raddr = IndexedSeq(id_raddr1, id_raddr2)
   val rf = new RegFile(31, xLen)
-  val id_rs = id_raddr.map(rf.read _)
+
   val ctrl_killd = Wire(Bool())
   val id_npc = (ibuf.io.pc.asSInt + ImmGen(IMM_UJ, id_inst(0))).asUInt
 
   val csr = Module(new CSRFile(perfEvents, coreParams.customCSRs.decls))
+
+  if (usingLNIC) {
+    // defaults for tx_cmd and rx_cmd
+    csr.io.rx.get.cmd.ready := false.B
+    csr.io.tx.get.cmd.valid := false.B
+    csr.io.tx.get.cmd.bits := 0.U
+
+    // Connect CSRFile network IO to RocketCore IO
+    csr.io.net.get.in <> io.net.get.in
+    io.net.get.out <> csr.io.net.get.out
+  }
+
+  // TODO(sibanez): how to drive reg file read enable for L-NIC?
+  val id_rs = id_raddr.zip(id_ren).map {
+    case (addr, rd_en) => rf.read(addr, rd_en && !ctrl_killd, csr.io.rx, usingLNIC)
+  } 
+
   val id_csr_en = id_ctrl.csr.isOneOf(CSR.S, CSR.C, CSR.W)
   val id_system_insn = id_ctrl.csr === CSR.I
   val id_csr_ren = id_ctrl.csr.isOneOf(CSR.S, CSR.C) && id_raddr1 === UInt(0)
   val id_csr = Mux(id_csr_ren, CSR.R, id_ctrl.csr)
   val id_sfence = id_ctrl.mem && id_ctrl.mem_cmd === M_SFENCE
   val id_csr_flush = id_sfence || id_system_insn || (id_csr_en && !id_csr_ren && csr.io.decode(0).write_flush)
-
-  if (usingLNIC) {
-    csr.io.net.get.flipConnect(io.net.get)
-  }
 
   val id_scie_decoder = if (!rocketParams.useSCIE) Wire(new SCIEDecoderInterface) else {
     val d = Module(new SCIEDecoder)
@@ -647,7 +660,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
                  Mux(wb_ctrl.csr =/= CSR.N, csr.io.rw.rdata,
                  Mux(wb_ctrl.mul, mul.map(_.io.resp.bits.data).getOrElse(wb_reg_wdata),
                  wb_reg_wdata))))
-  when (rf_wen) { rf.write(rf_waddr, rf_wdata) }
+  when (rf_wen) { rf.write(rf_waddr, rf_wdata, csr.io.tx, usingLNIC) }
 
   // hook up control/status regfile
   csr.io.ungated_clock := clock
@@ -948,20 +961,54 @@ class RegFile(n: Int, w: Int, zero: Boolean = false) {
   private def access(addr: UInt) = rf(~addr(log2Up(n)-1,0))
   private val reads = ArrayBuffer[(UInt,UInt)]()
   private var canRead = true
-  def read(addr: UInt) = {
+
+  // TODO(sibanez): what happens when both reg sources are LREAD? They should both get the current FIFO value
+  def read(addr: UInt, lnic_rd_en: Bool, csr_rx: Option[CSRRxCmd], usingLNIC: Boolean) = {
     require(canRead)
     reads += addr -> Wire(UInt())
-    reads.last._2 := Mux(Bool(zero) && addr === UInt(0), UInt(0), access(addr))
+
+    if (usingLNIC) {
+      when (addr === 0.U) {
+        reads.last._2 := 0.U
+      }.elsewhen (addr === LNICConsts.LREAD_ADDR && lnic_rd_en) {
+        // read from rxQueue
+        // NOTE: if csr_rx.get.cmd.valid == false.B then the result is undefined.
+        // Alternatively, we could stall the pipeline until valid data arrives,
+        // but we won't do that for now.
+        csr_rx.get.cmd.ready := true.B
+        reads.last._2 := csr_rx.get.cmd.bits
+      }.otherwise {
+        reads.last._2 := access(addr)
+      }
+    } else {
+      reads.last._2 := Mux(Bool(zero) && addr === UInt(0), UInt(0), access(addr))
+    }
+
     reads.last._2
   }
-  def write(addr: UInt, data: UInt) = {
+
+  // This method is only invoked when rf_wen is set.
+  def write(addr: UInt, data: UInt, csr_tx: Option[CSRTxCmd], usingLNIC: Boolean) = {
     canRead = false
     when (addr =/= UInt(0)) {
-      access(addr) := data
+      if (usingLNIC) {
+        when (addr === LNICConsts.LWRITE_ADDR) {
+          // write to txQueue
+          csr_tx.get.cmd.valid := true.B
+          csr_tx.get.cmd.bits := data
+        }.otherwise {
+          access(addr) := data
+        }
+      } else {
+        access(addr) := data
+      }
+      // update the two read signals
       for ((raddr, rdata) <- reads)
         when (addr === raddr) { rdata := data }
     }
   }
+
+
 }
 
 object ImmGen {
