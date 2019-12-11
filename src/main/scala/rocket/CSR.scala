@@ -182,11 +182,11 @@ class CSRDecodeIO extends Bundle {
 }
 
 class CSRTxCmd extends Bundle {
-  val cmd = Flipped(Decoupled(UInt(64)))
+  val cmd = Flipped(Decoupled(UInt(width = 64)))
 }
 
 class CSRRxCmd extends Bundle {
-  val cmd = Decoupled(UInt(64))
+  val cmd = Decoupled(UInt(width = 64))
 }
 
 class CSRFileIO(implicit p: Parameters) extends CoreBundle
