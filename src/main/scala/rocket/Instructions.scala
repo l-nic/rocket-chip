@@ -342,7 +342,6 @@ object CSRs {
   val lmsgsrdy = 0x052
   val lread = 0x051
   val lwrite = 0x057
-  val lwrend = 0x058
   
   val cycle = 0xc00
   val time = 0xc01
@@ -561,7 +560,6 @@ object CSRs {
     res += lmsgsrdy
     res += lread
     res += lwrite
-    res += lwrend
     
     res += cycle
     res += time

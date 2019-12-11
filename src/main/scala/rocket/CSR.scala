@@ -348,7 +348,6 @@ class CSRFile(
 
   // Define LNIC CSRs, Rx/Tx queues, and additional wires
   val reg_lmsgsrdy = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
-  val reg_lwrend = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
   val txQueue_in = if (usingLNIC) Some(Wire(Decoupled(new StreamChannel(xLen)))) else None
   val rxQueue_out = if (usingLNIC) Some(Queue(io.net.get.in, p(LNICKey).inBufFlits)) else None
 
@@ -357,8 +356,8 @@ class CSRFile(
     io.tx.get.cmd.ready := txQueue_in.get.ready
     txQueue_in.get.valid := io.tx.get.cmd.valid
     txQueue_in.get.bits.data := io.tx.get.cmd.bits
-    txQueue_in.get.bits.keep := LNICConsts.NET_FULL_KEEP // TODO(sibanez): How to handle non 64-bit aligned msgs?
-    txQueue_in.get.bits.last := (reg_lwrend.get > 0.U)
+    txQueue_in.get.bits.keep := LNICConsts.NET_FULL_KEEP // default
+    txQueue_in.get.bits.last := 0.U // default
     // Connect txQueue output to network io output
     io.net.get.out := Queue(txQueue_in.get, p(LNICKey).outBufFlits)
 
@@ -507,7 +506,6 @@ class CSRFile(
 
   if (usingLNIC) {
     read_mapping += CSRs.lmsgsrdy -> reg_lmsgsrdy.get
-    read_mapping += CSRs.lwrend -> reg_lwrend.get
   }
 
   val pmpCfgPerCSR = xLen / new PMPConfig().getWidth
@@ -736,7 +734,56 @@ class CSRFile(
   val csr_wen = io.rw.cmd.isOneOf(CSR.S, CSR.C, CSR.W)
 
   if (usingLNIC) {
+    /**
+     * Assumuptions for dealing with msg lengths:
+     *   - The first word of each message is the message length
+     *   - The L-NIC module enforces the length on all RX messages
+     *   - This module (CSRFile) enforces the length on all TX messages 
+     */
+
+    /****************************************/
+    /* LNIC txQueue_in.bits.last/keep logic */
+    /****************************************/
+    val txMsgLen = RegInit(0.U(64.W))
+    val sTxWaitFirstWord :: sTxWaitLastWord :: Nil = Enum(2)
+    val txMsgState = RegInit(sTxWaitFirstWord)
+
+    switch (txMsgState) {
+      is (sTxWaitFirstWord) {
+        when (txQueue_in.get.valid && txQueue_in.get.ready) {
+          // record msg length
+          txMsgLen := txQueue_in.get.bits.data
+          txMsgState := sTxWaitLastWord
+        }
+      }
+      is (sTxWaitLastWord) {
+        when (txQueue_in.get.valid && txQueue_in.get.ready) {
+          when (txMsgLen > LNICConsts.NET_IF_BYTES.U) {
+            txMsgLen := txMsgLen - LNICConsts.NET_IF_BYTES.U
+          }.otherwise {
+            txQueue_in.get.bits.last := true.B
+            // TODO(sibanez): make this parameterizable
+            switch(txMsgLen) {
+              is (0.U) { txQueue_in.get.bits.keep := "b00000000".U }
+              is (1.U) { txQueue_in.get.bits.keep := "b00000001".U }
+              is (2.U) { txQueue_in.get.bits.keep := "b00000011".U }
+              is (3.U) { txQueue_in.get.bits.keep := "b00000111".U }
+              is (4.U) { txQueue_in.get.bits.keep := "b00001111".U }
+              is (5.U) { txQueue_in.get.bits.keep := "b00011111".U }
+              is (6.U) { txQueue_in.get.bits.keep := "b00111111".U }
+              is (7.U) { txQueue_in.get.bits.keep := "b01111111".U }
+              is (8.U) { txQueue_in.get.bits.keep := "b11111111".U }
+            }
+            txMsgLen := 0.U
+            txMsgState := sTxWaitFirstWord
+          }
+        }
+      }
+    }
+
+    /**********************************/
     /* LNIC lmsgsrdy CSR update logic */
+    /**********************************/
     val dec_lmsgsrdy = Wire(Bool())
     val inc_lmsgsrdy = Wire(Bool())
 
@@ -748,20 +795,20 @@ class CSRFile(
     }
 
     // state machine to determine when the first word of a msg arrives at the rxQueue
-    val sWaitFirstWord :: sWaitLastWord :: Nil = Enum(2)
-    val msgState = RegInit(sWaitFirstWord)
+    val sRxWaitFirstWord :: sRxWaitLastWord :: Nil = Enum(2)
+    val rxMsgState = RegInit(sRxWaitFirstWord)
 
-    inc_lmsgsrdy := ((msgState === sWaitFirstWord) && io.net.get.in.valid && io.net.get.in.ready)
+    inc_lmsgsrdy := ((rxMsgState === sRxWaitFirstWord) && io.net.get.in.valid && io.net.get.in.ready)
 
-    switch (msgState) {
-      is (sWaitFirstWord) {
+    switch (rxMsgState) {
+      is (sRxWaitFirstWord) {
         when (io.net.get.in.valid && io.net.get.in.ready && !io.net.get.in.bits.last) {
-          msgState := sWaitLastWord
+          rxMsgState := sRxWaitLastWord
         }
       }
-      is (sWaitLastWord) {
+      is (sRxWaitLastWord) {
         when (io.net.get.in.valid && io.net.get.in.ready && io.net.get.in.bits.last) {
-          msgState := sWaitFirstWord
+          rxMsgState := sRxWaitFirstWord
         }
       }
     }
@@ -779,16 +826,6 @@ class CSRFile(
       when (reg_lmsgsrdy.get > 0) {
         reg_lmsgsrdy.get := reg_lmsgsrdy.get - 1.U
       }
-    }
-
-    // Update lwrend CSR
-    when (csr_wen && decoded_addr(CSRs.lwrend)) {
-      // update lwrend with CPU provided value
-      reg_lwrend.get := wdata
-    }.elsewhen (txQueue_in.get.valid && reg_lwrend.get > 0.U) {
-      // Clear lwrend CSR when writing the last word to the txQueue.
-      // This is so that the CPU only has to set lwrend before writing the last word of each msg.
-      reg_lwrend.get := 0.U
     }
   }
 
