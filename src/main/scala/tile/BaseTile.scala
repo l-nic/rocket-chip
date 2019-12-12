@@ -37,6 +37,8 @@ trait HasNonDiplomaticTileParameters {
   def tileParams: TileParams = p(TileKey)
 
   def usingLNIC: Boolean = p(LNICKey).usingLNIC
+  def lnicUsingGPRs: Boolean = p(LNICKey).usingGPRs
+  def lnicUsingCSRs: Boolean = !p(LNICKey).usingGPRs
   def usingVM: Boolean = tileParams.core.useVM
   def usingUser: Boolean = tileParams.core.useUser || usingVM
   def usingDebug: Boolean = tileParams.core.useDebug

@@ -260,10 +260,12 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val csr = Module(new CSRFile(perfEvents, coreParams.customCSRs.decls))
 
   if (usingLNIC) {
-    // defaults for tx_cmd and rx_cmd
-    csr.io.rx.get.cmd.ready := false.B
-    csr.io.tx.get.cmd.valid := false.B
-    csr.io.tx.get.cmd.bits := 0.U
+    if (lnicUsingGPRs) {
+      // defaults for tx_cmd and rx_cmd
+      csr.io.rx.get.cmd.ready := false.B
+      csr.io.tx.get.cmd.valid := false.B
+      csr.io.tx.get.cmd.bits := 0.U
+    }
 
     // Connect CSRFile network IO to RocketCore IO
     csr.io.net.get.in <> io.net.get.in
@@ -272,7 +274,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
   // TODO(sibanez): how to drive reg file read enable for L-NIC?
   val id_rs = id_raddr.zip(id_ren).map {
-    case (addr, rd_en) => rf.read(addr, rd_en && !ctrl_killd, csr.io.rx, usingLNIC)
+    case (addr, rd_en) => rf.read(addr, rd_en && !ctrl_killd, csr.io.rx, usingLNIC && lnicUsingGPRs)
   } 
 
   val id_csr_en = id_ctrl.csr.isOneOf(CSR.S, CSR.C, CSR.W)
@@ -660,7 +662,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
                  Mux(wb_ctrl.csr =/= CSR.N, csr.io.rw.rdata,
                  Mux(wb_ctrl.mul, mul.map(_.io.resp.bits.data).getOrElse(wb_reg_wdata),
                  wb_reg_wdata))))
-  when (rf_wen) { rf.write(rf_waddr, rf_wdata, csr.io.tx, usingLNIC) }
+  when (rf_wen) { rf.write(rf_waddr, rf_wdata, csr.io.tx, usingLNIC && lnicUsingGPRs) }
 
   // hook up control/status regfile
   csr.io.ungated_clock := clock
@@ -963,11 +965,11 @@ class RegFile(n: Int, w: Int, zero: Boolean = false) {
   private var canRead = true
 
   // TODO(sibanez): what happens when both reg sources are LREAD? They should both get the current FIFO value
-  def read(addr: UInt, lnic_rd_en: Bool, csr_rx: Option[CSRRxCmd], usingLNIC: Boolean) = {
+  def read(addr: UInt, lnic_rd_en: Bool, csr_rx: Option[CSRRxCmd], usingLNICGPRs: Boolean) = {
     require(canRead)
     reads += addr -> Wire(UInt())
 
-    if (usingLNIC) {
+    if (usingLNICGPRs) {
       when (addr === 0.U) {
         reads.last._2 := 0.U
       }.elsewhen (addr === LNICConsts.LREAD_ADDR && lnic_rd_en) {
@@ -988,10 +990,10 @@ class RegFile(n: Int, w: Int, zero: Boolean = false) {
   }
 
   // This method is only invoked when rf_wen is set.
-  def write(addr: UInt, data: UInt, csr_tx: Option[CSRTxCmd], usingLNIC: Boolean) = {
+  def write(addr: UInt, data: UInt, csr_tx: Option[CSRTxCmd], usingLNICGPRs: Boolean) = {
     canRead = false
     when (addr =/= UInt(0)) {
-      if (usingLNIC) {
+      if (usingLNICGPRs) {
         when (addr === LNICConsts.LWRITE_ADDR) {
           // write to txQueue
           csr_tx.get.cmd.valid := true.B

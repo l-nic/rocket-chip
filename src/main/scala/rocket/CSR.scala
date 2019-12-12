@@ -230,11 +230,12 @@ class CSRFileIO(implicit p: Parameters) extends CoreBundle
   val trace = Vec(retireWidth, new TracedInstruction).asOutput
   val net = if (usingLNIC) Some(new LNICCoreIO()) else None
   // RegFile tells CSRFile when to enq data into txQueue
-  val tx = if (usingLNIC) Some(new CSRTxCmd) else None
+  val tx = if (usingLNIC && lnicUsingGPRs) Some(new CSRTxCmd) else None
   // RegFile tells CSRFile when to deq data from rxQueue
-  val rx = if (usingLNIC) Some(new CSRRxCmd) else None
+  val rx = if (usingLNIC && lnicUsingGPRs) Some(new CSRRxCmd) else None
 }
 
+@chiselName
 class CSRFile(
   perfEventSets: EventSets = new EventSets(Seq()),
   customCSRs: Seq[CustomCSR] = Nil)(implicit p: Parameters)
@@ -352,19 +353,30 @@ class CSRFile(
   val rxQueue_out = if (usingLNIC) Some(Queue(io.net.get.in, p(LNICKey).inBufFlits)) else None
 
   if (usingLNIC) {
-    /* Wire up txQueue */
-    io.tx.get.cmd.ready := txQueue_in.get.ready
-    txQueue_in.get.valid := io.tx.get.cmd.valid
-    txQueue_in.get.bits.data := io.tx.get.cmd.bits
-    txQueue_in.get.bits.keep := LNICConsts.NET_FULL_KEEP // default
-    txQueue_in.get.bits.last := 0.U // default
     // Connect txQueue output to network io output
     io.net.get.out := Queue(txQueue_in.get, p(LNICKey).outBufFlits)
+    if (lnicUsingGPRs) {
+      /* Wire up txQueue_in */
+      io.tx.get.cmd.ready := txQueue_in.get.ready
+      txQueue_in.get.valid := io.tx.get.cmd.valid
+      txQueue_in.get.bits.data := io.tx.get.cmd.bits
+      txQueue_in.get.bits.keep := LNICConsts.NET_FULL_KEEP // default
+      txQueue_in.get.bits.last := false.B // default
+  
+      /* Wire up rxQueue_out */
+      rxQueue_out.get.ready := io.rx.get.cmd.ready
+      io.rx.get.cmd.valid := rxQueue_out.get.valid
+      io.rx.get.cmd.bits := rxQueue_out.get.bits.data
+    } else { // using CSRs
+      /* Set txQueue_in defaults */
+      txQueue_in.get.valid := false.B
+      txQueue_in.get.bits.data := 0.U
+      txQueue_in.get.bits.keep := LNICConsts.NET_FULL_KEEP
+      txQueue_in.get.bits.last := false.B
 
-    /* Wire up rxQueue */
-    rxQueue_out.get.ready := io.rx.get.cmd.ready
-    io.rx.get.cmd.valid := rxQueue_out.get.valid
-    io.rx.get.cmd.bits := rxQueue_out.get.bits.data
+      /* Set rxQueue_out defaults */
+      rxQueue_out.get.ready := false.B
+    }
   }
 
   val reg_instret = WideCounter(64, io.retire)
@@ -506,6 +518,10 @@ class CSRFile(
 
   if (usingLNIC) {
     read_mapping += CSRs.lmsgsrdy -> reg_lmsgsrdy.get
+    if (lnicUsingCSRs) {
+      read_mapping += CSRs.lread -> rxQueue_out.get.bits.data
+      read_mapping += CSRs.lwrite -> 0.U
+    }
   }
 
   val pmpCfgPerCSR = xLen / new PMPConfig().getWidth
@@ -568,7 +584,8 @@ class CSRFile(
       Bool(usingDebug) && decodeAny(debug_csrs) && !reg_debug ||
       io_dec.fp_csr && io_dec.fp_illegal
     io_dec.write_illegal := io_dec.csr(11,10).andR
-    io_dec.write_flush := !(io_dec.csr >= CSRs.mscratch && io_dec.csr <= CSRs.mtval || io_dec.csr >= CSRs.sscratch && io_dec.csr <= CSRs.stval)
+    // Do not flush the pipeline on writes to LNIC head/tail CSR regs
+    io_dec.write_flush := !(io_dec.csr >= CSRs.mscratch && io_dec.csr <= CSRs.mtval || io_dec.csr >= CSRs.sscratch && io_dec.csr <= CSRs.stval || io_dec.csr === CSRs.lread || io_dec.csr === CSRs.lwrite)
     io_dec.system_illegal := reg_mstatus.prv < io_dec.csr(9,8) ||
       is_wfi && !allow_wfi ||
       is_ret && !allow_sret ||
@@ -741,6 +758,21 @@ class CSRFile(
      *   - This module (CSRFile) enforces the length on all TX messages 
      */
 
+    if (lnicUsingCSRs) {
+      // wire up txQueue_in
+      when (csr_wen && decoded_addr(CSRs.lwrite)) {
+        txQueue_in.get.valid := true.B
+        txQueue_in.get.bits.data := wdata
+        // NOTE: txQueue_in.get.bits.last/keep are driven below
+        // TODO(sibanez): what to do when txQueue is full (i.e. !txQueue_in.ready)
+        // That will only happen if the NIC is unable to keep up with the CPU
+      }
+
+      // wire up rxQueue_out
+      val csr_ren = io.rw.cmd.isOneOf(CSR.R, CSR.I, CSR.W, CSR.S, CSR.C)
+      rxQueue_out.get.ready := csr_ren && decoded_addr(CSRs.lread)
+    }
+
     /****************************************/
     /* LNIC txQueue_in.bits.last/keep logic */
     /****************************************/
@@ -787,7 +819,7 @@ class CSRFile(
     val dec_lmsgsrdy = Wire(Bool())
     val inc_lmsgsrdy = Wire(Bool())
 
-    when (rxQueue_out.get.ready) {
+    when (rxQueue_out.get.ready && rxQueue_out.get.valid) {
       // decrement lmsgsrdy CSR when the last word of a msg is read from the rxQueue
       dec_lmsgsrdy := rxQueue_out.get.bits.last
     }.otherwise {
@@ -817,15 +849,9 @@ class CSRFile(
     // lmsgsrdy should be incremented when the first word of a msg arrives at the rxQueue
     // and decremented when the last word of a msg is read from rxQueue
     when (inc_lmsgsrdy && !dec_lmsgsrdy) {
-      // prevent overflow
-      when (reg_lmsgsrdy.get < ~0.U(xLen.W)) {
-        reg_lmsgsrdy.get := reg_lmsgsrdy.get + 1.U
-      }
+      reg_lmsgsrdy.get := reg_lmsgsrdy.get + 1.U
     }.elsewhen (!inc_lmsgsrdy && dec_lmsgsrdy) {
-      // prevent underflow
-      when (reg_lmsgsrdy.get > 0) {
-        reg_lmsgsrdy.get := reg_lmsgsrdy.get - 1.U
-      }
+      reg_lmsgsrdy.get := reg_lmsgsrdy.get - 1.U
     }
   }
 

@@ -32,6 +32,7 @@ object LNICConsts {
 
 case class LNICParams(
   usingLNIC: Boolean = false,
+  usingGPRs: Boolean = false,
   inBufFlits: Int  = 2 * LNICConsts.ETH_MAX_BYTES / LNICConsts.NET_IF_BYTES,
   outBufFlits: Int = 2 * LNICConsts.ETH_MAX_BYTES / LNICConsts.NET_IF_BYTES
 )
@@ -147,9 +148,9 @@ trait HasLNICModuleImp extends LazyModuleImp with HasTileParameters {
     }
   }
 
-  def connectPktGen() {
+  def connectPktGen(pktLen: Int = 64) {
     netPorts.foreach { net =>
-      val pktGen = Module(new PktGen)
+      val pktGen = Module(new PktGen(pktLen))
       pktGen.io.net.in <> net.out
       net.in <> pktGen.io.net.out
     }
@@ -159,18 +160,20 @@ trait HasLNICModuleImp extends LazyModuleImp with HasTileParameters {
 
 /* Test Modules */
 
-class PktGen extends Module {
+class PktGen (pktLen: Int = 64) extends Module {
   val io = IO(new Bundle {
     val net = new LNICNetIO
   })
 
-  /* A simple module that generates a 4 word pkt once every 100 cycles */
+  /* A simple module that generates a 8 word pkt (plus one word msg length) once every 100 cycles */
 
   val pktDelay = RegInit(0.U(64.W))
   val wordCnt = RegInit(0.U(64.W))
 
   val sWaitStart :: sWriteWords :: sWaitResp :: Nil = Enum(3)
   val state = RegInit(sWaitStart)
+
+  val numWords = pktLen/LNICConsts.NET_IF_BYTES + 1 // one for msg length as the first word
 
   // default io
   io.net.in.ready := true.B
@@ -191,12 +194,15 @@ class PktGen extends Module {
     is (sWriteWords) {
       // drive outputs
       io.net.out.valid := true.B
-      when (wordCnt === 3.U) {
+      io.net.out.bits.data := wordCnt
+      when (wordCnt === 0.U) {
+        io.net.out.bits.data := pktLen.asUInt
+      }
+      when (wordCnt === (numWords - 1).asUInt) {
         io.net.out.bits.last := true.B
       }
-      io.net.out.bits.data := wordCnt
       // next state logic
-      when (wordCnt === 3.U && io.net.out.ready) {
+      when (wordCnt === (numWords - 1).asUInt && io.net.out.ready) {
         state := sWaitResp
         wordCnt := 0.U
       } .otherwise {
