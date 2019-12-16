@@ -177,6 +177,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
   val ex_reg_xcpt_interrupt  = Reg(Bool())
   val ex_reg_valid           = Reg(Bool())
+  val ex_reg_lnic_ren        = Some(Reg(Bool()))
   val ex_reg_rvc             = Reg(Bool())
   val ex_reg_btb_resp        = Reg(new BTBResp)
   val ex_reg_xcpt            = Reg(Bool())
@@ -194,6 +195,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
   val mem_reg_xcpt_interrupt  = Reg(Bool())
   val mem_reg_valid           = Reg(Bool())
+  val mem_reg_lnic_ren        = Some(Reg(Bool()))
   val mem_reg_rvc             = Reg(Bool())
   val mem_reg_btb_resp        = Reg(new BTBResp)
   val mem_reg_xcpt            = Reg(Bool())
@@ -258,13 +260,21 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val id_npc = (ibuf.io.pc.asSInt + ImmGen(IMM_UJ, id_inst(0))).asUInt
 
   val csr = Module(new CSRFile(perfEvents, coreParams.customCSRs.decls))
+  
+  val ctrl_killx = Wire(Bool())
+  val ctrl_killm = Wire(Bool())
 
   if (usingLNIC) {
     if (lnicUsingGPRs) {
       // defaults for tx_cmd and rx_cmd
-      csr.io.rx.get.cmd.ready := false.B
       csr.io.tx.get.cmd.valid := false.B
       csr.io.tx.get.cmd.bits := 0.U
+      csr.io.rx.get.cmd.ready := false.B
+      // drive the unread cmd for pipeline flushes
+      val ex_lnic_undo = ex_reg_lnic_ren.get && ctrl_killx && ex_reg_valid
+      val mem_lnic_undo = mem_reg_lnic_ren.get && ctrl_killm && mem_reg_valid
+      csr.io.rx_undo.get.valid := ex_lnic_undo || mem_lnic_undo
+      csr.io.rx_undo.get.bits := ex_lnic_undo.asUInt + mem_lnic_undo.asUInt
     }
 
     // Connect CSRFile network IO to RocketCore IO
@@ -416,6 +426,10 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   ex_reg_replay := !take_pc && ibuf.io.inst(0).valid && ibuf.io.inst(0).bits.replay
   ex_reg_xcpt := !ctrl_killd && id_xcpt
   ex_reg_xcpt_interrupt := !take_pc && ibuf.io.inst(0).valid && csr.io.interrupt
+  // Remember if the instruction read the LNIC rxQueue in the decode stage
+  if (usingLNIC && lnicUsingGPRs) {
+    ex_reg_lnic_ren.get := csr.io.rx.get.cmd.ready
+  }
 
   when (!ctrl_killd) {
     ex_ctrl := id_ctrl
@@ -480,7 +494,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
                              ex_ctrl.div && !div.io.req.ready
   val replay_ex_load_use = wb_dcache_miss && ex_reg_load_use
   val replay_ex = ex_reg_replay || (ex_reg_valid && (replay_ex_structural || replay_ex_load_use))
-  val ctrl_killx = take_pc_mem_wb || replay_ex || !ex_reg_valid
+  ctrl_killx := take_pc_mem_wb || replay_ex || !ex_reg_valid
   // detect 2-cycle load-use delay for LB/LH/SC
   val ex_slow_bypass = ex_ctrl.mem_cmd === M_XSC || ex_reg_mem_size < 2
   val ex_sfence = Bool(usingVM) && ex_ctrl.mem && ex_ctrl.mem_cmd === M_SFENCE
@@ -513,6 +527,10 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   mem_reg_replay := !take_pc_mem_wb && replay_ex
   mem_reg_xcpt := !ctrl_killx && ex_xcpt
   mem_reg_xcpt_interrupt := !take_pc_mem_wb && ex_reg_xcpt_interrupt
+  // Remember if the instruction read the LNIC rxQueue in the decode stage
+  if (usingLNIC && lnicUsingGPRs) {
+    mem_reg_lnic_ren.get := ex_reg_lnic_ren.get
+  }
 
   // on pipeline flushes, cause mem_npc to hold the sequential npc, which
   // will drive the W-stage npc mux
@@ -573,7 +591,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val replay_mem  = dcache_kill_mem || mem_reg_replay || fpu_kill_mem
   val killm_common = dcache_kill_mem || take_pc_wb || mem_reg_xcpt || !mem_reg_valid
   div.io.kill := killm_common && Reg(next = div.io.req.fire())
-  val ctrl_killm = killm_common || mem_xcpt || fpu_kill_mem
+  ctrl_killm := killm_common || mem_xcpt || fpu_kill_mem
 
   // writeback stage
   wb_reg_valid := !ctrl_killm

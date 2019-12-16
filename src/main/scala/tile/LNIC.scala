@@ -3,6 +3,9 @@ package freechips.rocketchip.tile
 
 import Chisel._
 
+import chisel3.{chiselTypeOf, WireDefault}
+import chisel3.util.{EnqIO, DeqIO}
+import chisel3.experimental._
 import freechips.rocketchip.config._
 import freechips.rocketchip.subsystem._
 import freechips.rocketchip.diplomacy._
@@ -33,6 +36,8 @@ object LNICConsts {
 case class LNICParams(
   usingLNIC: Boolean = false,
   usingGPRs: Boolean = false,
+  rxQueueFlits: Int = 16,
+  txQueueFlits: Int = 16,
   inBufFlits: Int  = 2 * LNICConsts.ETH_MAX_BYTES / LNICConsts.NET_IF_BYTES,
   outBufFlits: Int = 2 * LNICConsts.ETH_MAX_BYTES / LNICConsts.NET_IF_BYTES
 )
@@ -100,6 +105,125 @@ class LNICModuleImp(outer: LNIC)(implicit p: Parameters) extends LazyModuleImp(o
   // Connect io.core to io.net with FIFOs for now
   io.core.out <> Queue(io.net.in, p(LNICKey).inBufFlits)
   io.net.out <> Queue(io.core.in, p(LNICKey).outBufFlits)
+}
+
+/** An I/O Bundle for LNIC RxQueue.
+ *  Based on QueueIO in: chisel3/src/main/scala/chisel3/util/Decoupled.scala
+  * @param gen The type of data to queue
+  * @param entries The max number of entries in the queue.
+  */
+class LNICRxQueueIO[T <: Data](private val gen: T, val entries: Int) extends Bundle
+{ // See github.com/freechipsproject/chisel3/issues/765 for why gen is a private val and proposed replacement APIs.
+
+  /* These may look inverted, because the names (enq/deq) are from the perspective of the client,
+   *  but internally, the queue implementation itself sits on the other side
+   *  of the interface so uses the flipped instance.
+   */
+  /** I/O to enqueue data (client is producer, and Queue object is consumer), is [[Chisel.DecoupledIO]] flipped. */
+  val enq = Flipped(EnqIO(gen))
+  /** I/O to dequeue data (client is consumer and Queue object is producer), is [[Chisel.DecoupledIO]]*/
+  val deq = Flipped(DeqIO(gen))
+  /** The current amount of data in the queue */
+  val count = Output(UInt(log2Ceil(entries + 1).W))
+  /** Command to "unread" either the last one or two words that were previously dequeued */
+  val unread = Flipped(Valid(UInt(width = 2)))
+}
+
+/**
+ * LNIC RxQueue implementation.
+ * This module resides in the Rocket core's CSRFile. It is used in place of a simple FIFO
+ * when using LNIC w/ GPRs. It is basically a normal FIFO that supports an "unread" operation
+ * for up to two words.
+ * That is, the FIFO retains the last two words that were read out of it so that it can roll
+ * back the read pointer when the unread cmd is asserted.
+ * Based on the Queue class in: chisel3/src/main/scala/chisel3/util/Decoupled.scala
+ * @param gen The type of data to queue
+ * @param entries The max number of entries in the queue
+ *
+ * @example {{{
+ * val q = Module(new LNICRxQueue(UInt(), 16))
+ * q.io.enq <> producer.io.out
+ * consumer.io.in <> q.io.deq
+ * }}}
+ */
+@chiselName
+class LNICRxQueue[T <: Data](gen: T,
+                             val entries: Int)
+                            (implicit compileOptions: chisel3.core.CompileOptions)
+    extends Module() {
+  @deprecated("Module constructor with override _reset deprecated, use withReset", "chisel3")
+  def this(gen: T, entries: Int, override_reset: Option[Bool]) = {
+    this(gen, entries)
+    this.override_reset = override_reset
+  }
+  @deprecated("Module constructor with override _reset deprecated, use withReset", "chisel3")
+  def this(gen: T, entries: Int, _reset: Bool) = {
+    this(gen, entries)
+    this.override_reset = Some(_reset)
+  }
+
+  val genType = if (compileOptions.declaredTypeMustBeUnbound) {
+    requireIsChiselType(gen)
+    gen
+  } else {
+    if (DataMirror.internal.isSynthesizable(gen)) {
+      chiselTypeOf(gen)
+    } else {
+      gen
+    }
+  }
+
+  require(isPow2(entries), "LNICRxQueue requires a power of 2 number of entries!")
+  val io = IO(new LNICRxQueueIO(genType, entries))
+
+  private val ram = Mem(entries, genType)
+  private val enq_ptr = RegInit(0.U(log2Ceil(entries).W))
+  private val deq_ptr = RegInit(0.U(log2Ceil(entries).W))
+  private val deq_ptr_minus1 = RegInit(0.U(log2Ceil(entries).W))
+  private val deq_ptr_minus2 = RegInit(0.U(log2Ceil(entries).W))
+  private val maybe_full = RegInit(false.B)
+
+  private val ptr_match = enq_ptr === deq_ptr_minus2
+  private val empty = ptr_match && !maybe_full
+  private val full = ptr_match && maybe_full
+  private val do_enq = WireDefault(io.enq.fire())
+  private val do_deq = WireDefault(io.deq.fire())
+
+  when (do_enq) {
+    ram(enq_ptr) := io.enq.bits
+    enq_ptr := enq_ptr + 1.U
+  }
+
+  when (do_deq && !io.unread.valid) {
+    // This is the common case: performing a dequeue without performing an unread
+    deq_ptr := deq_ptr + 1.U
+    when (deq_ptr_minus1 =/= deq_ptr) {
+      deq_ptr_minus1 := deq_ptr_minus1 + 1.U
+    }
+    when(deq_ptr_minus2 =/= deq_ptr_minus1) {
+      deq_ptr_minus2 := deq_ptr_minus2 + 1.U
+    }
+  } .elsewhen (io.unread.valid) {
+    // perform an unread operation (up to two words)
+    when (io.unread.bits === 2.U) {
+      deq_ptr := deq_ptr_minus2
+      deq_ptr_minus1 := deq_ptr_minus2
+    } .elsewhen (io.unread.bits === 1.U) {
+      deq_ptr := deq_ptr_minus1
+    }
+  }
+
+  when (do_enq =/= do_deq) {
+    maybe_full := do_enq
+  }
+
+  io.deq.valid := !empty
+  io.enq.ready := !full
+  io.deq.bits := ram(deq_ptr)
+
+  private val ptr_diff = enq_ptr - deq_ptr
+  // TODO(sibanez): verify that count is actually driven correctly
+  io.count := Mux(maybe_full && ptr_match, entries.U, 0.U) | ptr_diff
 }
 
 /** Tile-level mixins for including LNIC **/

@@ -233,6 +233,8 @@ class CSRFileIO(implicit p: Parameters) extends CoreBundle
   val tx = if (usingLNIC && lnicUsingGPRs) Some(new CSRTxCmd) else None
   // RegFile tells CSRFile when to deq data from rxQueue
   val rx = if (usingLNIC && lnicUsingGPRs) Some(new CSRRxCmd) else None
+  // RocketCore control logic indicates when to undo rx cmds (up to 2 words)
+  val rx_undo = if (usingLNIC && lnicUsingGPRs) Some(Flipped(Valid(UInt(width = 2)))) else None
 }
 
 @chiselName
@@ -350,11 +352,16 @@ class CSRFile(
   // Define LNIC CSRs, Rx/Tx queues, and additional wires
   val reg_lmsgsrdy = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
   val txQueue_in = if (usingLNIC) Some(Wire(Decoupled(new StreamChannel(xLen)))) else None
-  val rxQueue_out = if (usingLNIC) Some(Queue(io.net.get.in, p(LNICKey).inBufFlits)) else None
+  val rxQueue_out = if (usingLNIC) Some(Wire(Flipped(Decoupled(new StreamChannel(xLen))))) else None
+  // rxQueue must be able to support unread operations for pipeline flushes if using GPRs
+  val rxQueue = Module(new LNICRxQueue(new StreamChannel(xLen), p(LNICKey).rxQueueFlits))
 
   if (usingLNIC) {
+    // Connect rxQueue input / output
+    rxQueue.io.enq <> io.net.get.in
+    rxQueue_out.get <> rxQueue.io.deq
     // Connect txQueue output to network io output
-    io.net.get.out := Queue(txQueue_in.get, p(LNICKey).outBufFlits)
+    io.net.get.out := Queue(txQueue_in.get, p(LNICKey).txQueueFlits)
     if (lnicUsingGPRs) {
       /* Wire up txQueue_in */
       io.tx.get.cmd.ready := txQueue_in.get.ready
@@ -367,6 +374,9 @@ class CSRFile(
       rxQueue_out.get.ready := io.rx.get.cmd.ready
       io.rx.get.cmd.valid := rxQueue_out.get.valid
       io.rx.get.cmd.bits := rxQueue_out.get.bits.data
+
+      /* Wire up rxQueue unread cmd */
+      rxQueue.io.unread <> io.rx_undo.get
     } else { // using CSRs
       /* Set txQueue_in defaults */
       txQueue_in.get.valid := false.B
@@ -376,6 +386,10 @@ class CSRFile(
 
       /* Set rxQueue_out defaults */
       rxQueue_out.get.ready := false.B
+
+      /* Wire up rxQueue unread cmd */
+      rxQueue.io.unread.valid := false.B
+      rxQueue.io.unread.bits := 0.U
     }
   }
 
@@ -816,43 +830,48 @@ class CSRFile(
     /**********************************/
     /* LNIC lmsgsrdy CSR update logic */
     /**********************************/
-    val dec_lmsgsrdy = Wire(Bool())
-    val inc_lmsgsrdy = Wire(Bool())
+    // TODO(sibanez): for now, we just need lmsgsrdy to be >0 when there are words available and 0 otherwise.
+    // Eventually, it may be nice to use lmsgsrdy to indicate the actual number of msgs available.
+    reg_lmsgsrdy.get := (rxQueue.io.count > 0).asUInt
 
-    when (rxQueue_out.get.ready && rxQueue_out.get.valid) {
-      // decrement lmsgsrdy CSR when the last word of a msg is read from the rxQueue
-      dec_lmsgsrdy := rxQueue_out.get.bits.last
-    }.otherwise {
-      dec_lmsgsrdy := false.B
-    }
-
-    // state machine to determine when the first word of a msg arrives at the rxQueue
-    val sRxWaitFirstWord :: sRxWaitLastWord :: Nil = Enum(2)
-    val rxMsgState = RegInit(sRxWaitFirstWord)
-
-    inc_lmsgsrdy := ((rxMsgState === sRxWaitFirstWord) && io.net.get.in.valid && io.net.get.in.ready)
-
-    switch (rxMsgState) {
-      is (sRxWaitFirstWord) {
-        when (io.net.get.in.valid && io.net.get.in.ready && !io.net.get.in.bits.last) {
-          rxMsgState := sRxWaitLastWord
-        }
-      }
-      is (sRxWaitLastWord) {
-        when (io.net.get.in.valid && io.net.get.in.ready && io.net.get.in.bits.last) {
-          rxMsgState := sRxWaitFirstWord
-        }
-      }
-    }
-
-    // Update lmsgsrdy CSR
-    // lmsgsrdy should be incremented when the first word of a msg arrives at the rxQueue
-    // and decremented when the last word of a msg is read from rxQueue
-    when (inc_lmsgsrdy && !dec_lmsgsrdy) {
-      reg_lmsgsrdy.get := reg_lmsgsrdy.get + 1.U
-    }.elsewhen (!inc_lmsgsrdy && dec_lmsgsrdy) {
-      reg_lmsgsrdy.get := reg_lmsgsrdy.get - 1.U
-    }
+// TODO(sibanez): remove this ...
+//    val dec_lmsgsrdy = Wire(Bool())
+//    val inc_lmsgsrdy = Wire(Bool())
+//
+//    when (rxQueue_out.get.ready && rxQueue_out.get.valid) {
+//      // decrement lmsgsrdy CSR when the last word of a msg is read from the rxQueue
+//      dec_lmsgsrdy := rxQueue_out.get.bits.last
+//    }.otherwise {
+//      dec_lmsgsrdy := false.B
+//    }
+//
+//    // state machine to determine when the first word of a msg arrives at the rxQueue
+//    val sRxWaitFirstWord :: sRxWaitLastWord :: Nil = Enum(2)
+//    val rxMsgState = RegInit(sRxWaitFirstWord)
+//
+//    inc_lmsgsrdy := ((rxMsgState === sRxWaitFirstWord) && io.net.get.in.valid && io.net.get.in.ready)
+//
+//    switch (rxMsgState) {
+//      is (sRxWaitFirstWord) {
+//        when (io.net.get.in.valid && io.net.get.in.ready && !io.net.get.in.bits.last) {
+//          rxMsgState := sRxWaitLastWord
+//        }
+//      }
+//      is (sRxWaitLastWord) {
+//        when (io.net.get.in.valid && io.net.get.in.ready && io.net.get.in.bits.last) {
+//          rxMsgState := sRxWaitFirstWord
+//        }
+//      }
+//    }
+//
+//    // Update lmsgsrdy CSR
+//    // lmsgsrdy should be incremented when the first word of a msg arrives at the rxQueue
+//    // and decremented when the last word of a msg is read from rxQueue
+//    when (inc_lmsgsrdy && !dec_lmsgsrdy) {
+//      reg_lmsgsrdy.get := reg_lmsgsrdy.get + 1.U
+//    }.elsewhen (!inc_lmsgsrdy && dec_lmsgsrdy) {
+//      reg_lmsgsrdy.get := reg_lmsgsrdy.get - 1.U
+//    }
   }
 
   io.csrw_counter := Mux(coreParams.haveBasicCounters && csr_wen && (io.rw.addr.inRange(CSRs.mcycle, CSRs.mcycle + CSR.nCtr) || io.rw.addr.inRange(CSRs.mcycleh, CSRs.mcycleh + CSR.nCtr)), UIntToOH(io.rw.addr(log2Ceil(CSR.nCtr+nPerfCounters)-1, 0)), 0.U)
