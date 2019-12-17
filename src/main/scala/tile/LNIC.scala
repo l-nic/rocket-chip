@@ -183,9 +183,10 @@ class LNICRxQueue[T <: Data](gen: T,
   private val deq_ptr_minus2 = RegInit(0.U(log2Ceil(entries).W))
   private val maybe_full = RegInit(false.B)
 
-  private val ptr_match = enq_ptr === deq_ptr_minus2
-  private val empty = ptr_match && !maybe_full
-  private val full = ptr_match && maybe_full
+  private val ptr_match_full = enq_ptr === deq_ptr_minus2
+  private val ptr_match_empty = enq_ptr === deq_ptr
+  private val empty = ptr_match_empty && !maybe_full
+  private val full = ptr_match_full && maybe_full
   private val do_enq = WireDefault(io.enq.fire())
   private val do_deq = WireDefault(io.deq.fire())
 
@@ -221,9 +222,16 @@ class LNICRxQueue[T <: Data](gen: T,
   io.enq.ready := !full
   io.deq.bits := ram(deq_ptr)
 
-  private val ptr_diff = enq_ptr - deq_ptr
   // TODO(sibanez): verify that count is actually driven correctly
-  io.count := Mux(maybe_full && ptr_match, entries.U, 0.U) | ptr_diff
+  io.count := Mux(empty,
+                  0.U,
+                  Mux(full,
+                      Mux(deq_ptr_minus2 > deq_ptr,
+                          entries.U - (deq_ptr_minus2 - deq_ptr),
+                          entries.U - (deq_ptr - deq_ptr_minus2)),
+                      Mux(deq_ptr > enq_ptr,
+                          entries.U - (deq_ptr - enq_ptr),
+                          enq_ptr - deq_ptr)))
 }
 
 /** Tile-level mixins for including LNIC **/

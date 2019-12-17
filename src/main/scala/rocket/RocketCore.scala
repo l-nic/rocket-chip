@@ -428,7 +428,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   ex_reg_xcpt_interrupt := !take_pc && ibuf.io.inst(0).valid && csr.io.interrupt
   // Remember if the instruction read the LNIC rxQueue in the decode stage
   if (usingLNIC && lnicUsingGPRs) {
-    ex_reg_lnic_ren.get := csr.io.rx.get.cmd.ready
+    ex_reg_lnic_ren.get := csr.io.rx.get.cmd.ready && csr.io.rx.get.cmd.valid
   }
 
   when (!ctrl_killd) {
