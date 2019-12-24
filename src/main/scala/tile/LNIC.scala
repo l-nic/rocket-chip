@@ -31,6 +31,13 @@ object LNICConsts {
 
   val LWRITE_ADDR = 31.U
   val LREAD_ADDR = 30.U
+
+  val IP_TYPE = 0x800.U(16.W)
+  val LNIC_PROTO = 0x99.U(8.W)
+
+  val SWITCH_MAC_ADDR = 0x081122334408.U
+  val NIC_MAC_ADDR = 0x085566778808.U
+  val NIC_IP_ADDR = 0x11223344.U
 }
 
 case class LNICParams(
