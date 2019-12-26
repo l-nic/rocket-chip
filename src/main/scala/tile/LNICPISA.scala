@@ -485,6 +485,7 @@ class PISADeparserIO extends Bundle {
   override def cloneType = new PISADeparserIO.asInstanceOf[this.type]
 }
 
+@chiselName
 class PISADeparser(implicit p: Parameters) extends Module {
   val io = IO(new PISADeparserIO)
 

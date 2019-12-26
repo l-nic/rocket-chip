@@ -109,9 +109,30 @@ class LNIC(implicit p: Parameters) extends LazyModule {
  */
 class LNICModuleImp(outer: LNIC)(implicit p: Parameters) extends LazyModuleImp(outer) {
   val io = IO(new LNICIO)
-  // Connect io.core to io.net with FIFOs for now
-  io.core.out <> Queue(io.net.in, p(LNICKey).inBufFlits)
-  io.net.out <> Queue(io.core.in, p(LNICKey).outBufFlits)
+
+//  // Connect io.core to io.net with FIFOs for now
+//  io.core.out <> Queue(io.net.in, p(LNICKey).inBufFlits)
+//  io.net.out <> Queue(io.core.in, p(LNICKey).outBufFlits)
+
+  // NIC datapath
+  val pktize = Module(new LNICPktize)
+  val arbiter = Module(new LNICArbiter)
+  val pisa = Module(new LNICPISA)
+  val split = Module(new LNICSplit)
+  val assemble = Module(new LNICAssemble)
+
+  pktize.net_in <> io.core.in
+  arbiter.core_in <> pktize.net_out
+  arbiter.core_meta_in <> pktize.meta_out
+  arbiter.net_in <> io.net.in
+  pisa.net_in <> arbiter.net_out
+  pisa.meta_in <> arbiter.meta_out
+  split.net_in <> pisa.net_out
+  split.meta_in <> pisa.meta_out
+  io.net.out <> split.net_out
+  assemble.net_in <> split.core_out
+  assemble.meta_in <> split.core_meta_out
+  io.core.out <> assemble.net_out
 }
 
 /** An I/O Bundle for LNIC RxQueue.
