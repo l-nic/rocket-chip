@@ -267,6 +267,7 @@ class LNICSplit(implicit p: Parameters) extends Module {
  *
  * Tasks:
  *   - Reassemble pkts going to CPU into messages.
+ *   - Enforce message length
  *   - For now, assume all msgs consist of a single pkt and there is only one thread running on the core
  */
 class AssembleIO extends Bundle {
@@ -281,7 +282,86 @@ class AssembleIO extends Bundle {
 class LNICAssemble(implicit p: Parameters) extends Module {
   val io = IO(new AssembleIO)
 
-  io.net_out <> Queue(io.net_in, p(LNICKey).assemblePktBufFlits)
+  val pktQueue_in = Wire(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
+
+  io.net_out <> Queue(pktQueue_in, p(LNICKey).assemblePktBufFlits)
+  io.net_in.ready := pktQueue_in.ready
+
+  // default - connect net_in to pktQueue
+  pktQueue_in <> io.net_in
+
+  // state machine to compute message length using pktQueue_in
+  val sStart :: sEnd :: Nil = Enum(2)
+  val stateMsgLen = RegInit(sStart)
+
+  val reg_msg_len = RegInit(0.U)
+
+  switch (stateMsgLen) {
+    is (sStart) {
+      when (pktQueue_in.valid && pktQueue_in.ready) {
+        reg_msg_len := io.meta_in.bits.msg_len
+        when (!pktQueue_in.bits.last) {
+          stateMsgLen := sEnd
+        }
+      }
+    }
+    is (sEnd) {
+      when (pktQueue_in.valid && pktQueue_in.ready) {
+        reg_msg_len := reg_msg_len - PopCount(pktQueue_in.bits.keep)
+        when (pktQueue_in.bits.last) {
+          stateMsgLen := sStart
+        }
+      }
+    }
+  }
+
+  // state machine to enforce message length
+  // NOTE: this will not work properly for single word messages (i.e. just app header)
+  val sIdle :: sTruncate :: sPad :: Nil = Enum(3)
+  val state = RegInit(sIdle)
+
+  switch (state) {
+    is (sIdle) {
+      when (io.net_in.valid && io.net_in.ready && stateMsgLen =/= sStart) {
+        when (reg_msg_len > LNICConsts.NET_IF_BYTES.U && io.net_in.bits.last) {
+          // msg is too short - need to pad it
+          state := sPad
+          pktQueue_in.bits.last := false.B
+        } .elsewhen (reg_msg_len <= LNICConsts.NET_IF_BYTES.U && !io.net_in.bits.last) {
+          // msg is too long - need to truncate it
+          state := sTruncate
+          pktQueue_in.bits.last := true.B
+        }
+      }
+    }
+    is (sTruncate) {
+      pktQueue_in.valid := false.B
+      when (io.net_in.valid && io.net_in.ready && io.net_in.bits.last) {
+        state := sIdle
+      }
+    }
+    is (sPad) {
+      pktQueue_in.valid := true.B
+      pktQueue_in.bits.data := 0.U
+      when (io.net_in.valid && io.net_in.ready && reg_msg_len <= LNICConsts.NET_IF_BYTES.U) {
+        state := sIdle
+        pktQueue_in.bits.last := true.B
+        // TODO(sibanez): parameterize this
+        switch(reg_msg_len) {
+          is (0.U) { pktQueue_in.bits.keep := "b00000000".U }
+          is (1.U) { pktQueue_in.bits.keep := "b00000001".U }
+          is (2.U) { pktQueue_in.bits.keep := "b00000011".U }
+          is (3.U) { pktQueue_in.bits.keep := "b00000111".U }
+          is (4.U) { pktQueue_in.bits.keep := "b00001111".U }
+          is (5.U) { pktQueue_in.bits.keep := "b00011111".U }
+          is (6.U) { pktQueue_in.bits.keep := "b00111111".U }
+          is (7.U) { pktQueue_in.bits.keep := "b01111111".U }
+          is (8.U) { pktQueue_in.bits.keep := "b11111111".U }
+        }
+      }
+    }
+  }
+
 }
 
 
