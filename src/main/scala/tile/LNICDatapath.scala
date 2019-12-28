@@ -23,7 +23,7 @@ class PktizeMetaOut extends Bundle {
   val offset = UInt(16.W) // pkt offset within msg
   val lnic_src = UInt(16.W) // src context ID
 
-  override def cloneType = new PktizeMetaOut.asInstanceOf[this.type]
+  override def cloneType = new PktizeMetaOut().asInstanceOf[this.type]
 }
 
 class PktizeIO extends Bundle {
@@ -31,7 +31,7 @@ class PktizeIO extends Bundle {
   val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
   val meta_out = Valid(new PktizeMetaOut)
 
-  override def cloneType = new PktizeIO.asInstanceOf[this.type]
+  override def cloneType = new PktizeIO().asInstanceOf[this.type]
 }
 
 @chiselName
@@ -79,7 +79,7 @@ class ArbiterIO extends Bundle {
   val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
   val meta_out = Valid(new PISAMetaIn)
 
-  override def cloneType = new ArbiterIO.asInstanceOf[this.type]
+  override def cloneType = new ArbiterIO().asInstanceOf[this.type]
 }
 
 @chiselName
@@ -104,6 +104,10 @@ class LNICArbiter(implicit p: Parameters) extends Module {
   val inState = RegInit(sInSelect)
 
   val reg_selected = RegInit(false.B) // true = CPU, false = network
+
+  // default pktQueue_in
+  pktQueue_in.valid := false.B
+  pktQueue_in.bits := io.net_in.bits
 
   metaQueue_in.valid := false.B
   // defaults - used for pkts from network
@@ -209,7 +213,7 @@ class SplitIO extends Bundle {
   val core_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
   val core_meta_out = Valid(new PISAMetaOut)
 
-  override def cloneType = new SplitIO.asInstanceOf[this.type]
+  override def cloneType = new SplitIO().asInstanceOf[this.type]
 }
 
 @chiselName
@@ -231,14 +235,14 @@ class LNICSplit(implicit p: Parameters) extends Module {
 
   switch (state) {
     is (sWordOne) {
-      io.net_in.ready := Mux(io.meta_in.egress_id, io.core_out.ready, io.net_out.ready)
+      io.net_in.ready := Mux(io.meta_in.bits.egress_id, io.core_out.ready, io.net_out.ready)
       // connect core outputs
-      io.core_out.valid := io.meta_in.egress_id && io.net_in.valid
+      io.core_out.valid := io.meta_in.bits.egress_id && io.net_in.valid
       io.core_meta_out.valid := io.core_out.valid
       // connect net outputs
-      io.net_out.valid := !io.meta_in.egress_id && io.net_in.valid
+      io.net_out.valid := !io.meta_in.bits.egress_id && io.net_in.valid
       when (io.net_in.valid && io.net_in.ready) {
-        reg_egress_id := io.meta_in.egress_id
+        reg_egress_id := io.meta_in.bits.egress_id
         // next state logic
         when (!io.net_in.bits.last) {
           state := sWaitEnd
@@ -270,7 +274,7 @@ class AssembleIO extends Bundle {
   val meta_in = Flipped(Valid(new PISAMetaOut))
   val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
 
-  override def cloneType = new AssembleIO.asInstanceOf[this.type]
+  override def cloneType = new AssembleIO().asInstanceOf[this.type]
 }
 
 @chiselName

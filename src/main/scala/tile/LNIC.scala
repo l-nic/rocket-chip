@@ -19,10 +19,14 @@ object LNICConsts {
   val NET_LEN_BITS = 16
 
   val ETH_MAX_BYTES = 1520
+  val ETH_MIN_BYTES = 64
   val ETH_HEAD_BYTES = 16
   val ETH_MAC_BITS = 48
   val ETH_TYPE_BITS = 16
   val ETH_PAD_BITS = 16
+
+  val ETH_MAX_FLITS = ETH_MAX_BYTES/NET_IF_BYTES
+  val ETH_MIN_FLITS = ETH_MIN_BYTES/NET_IF_BYTES
 
   val IPV4_HEAD_BYTES = 20
 
@@ -35,9 +39,9 @@ object LNICConsts {
   val IP_TYPE = 0x800.U(16.W)
   val LNIC_PROTO = 0x99.U(8.W)
 
-  val SWITCH_MAC_ADDR = 0x081122334408.U
-  val NIC_MAC_ADDR = 0x085566778808.U
-  val NIC_IP_ADDR = 0x11223344.U
+  val SWITCH_MAC_ADDR = "h081122334408".U
+  val NIC_MAC_ADDR = "h085566778808".U
+  val NIC_IP_ADDR = "h11223344".U
 }
 
 case class LNICParams(
@@ -45,8 +49,18 @@ case class LNICParams(
   usingGPRs: Boolean = false,
   rxQueueFlits: Int = 16,
   txQueueFlits: Int = 16,
-  inBufFlits: Int  = 2 * LNICConsts.ETH_MAX_BYTES / LNICConsts.NET_IF_BYTES,
-  outBufFlits: Int = 2 * LNICConsts.ETH_MAX_BYTES / LNICConsts.NET_IF_BYTES
+//  inBufFlits: Int  = 2 * LNICConsts.ETH_MAX_BYTES / LNICConsts.NET_IF_BYTES,
+//  outBufFlits: Int = 2 * LNICConsts.ETH_MAX_BYTES / LNICConsts.NET_IF_BYTES,
+  pktizePktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
+  arbiterPktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
+  arbiterMetaBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
+  assemblePktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
+  parserPktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
+  parserMetaBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
+  maPktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
+  maMetaBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
+  deparserPktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
+  deparserMetaBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS
 )
 
 case object LNICKey extends Field[LNICParams]
@@ -121,18 +135,18 @@ class LNICModuleImp(outer: LNIC)(implicit p: Parameters) extends LazyModuleImp(o
   val split = Module(new LNICSplit)
   val assemble = Module(new LNICAssemble)
 
-  pktize.net_in <> io.core.in
-  arbiter.core_in <> pktize.net_out
-  arbiter.core_meta_in <> pktize.meta_out
-  arbiter.net_in <> io.net.in
-  pisa.net_in <> arbiter.net_out
-  pisa.meta_in <> arbiter.meta_out
-  split.net_in <> pisa.net_out
-  split.meta_in <> pisa.meta_out
-  io.net.out <> split.net_out
-  assemble.net_in <> split.core_out
-  assemble.meta_in <> split.core_meta_out
-  io.core.out <> assemble.net_out
+  pktize.io.net_in <> io.core.in
+  arbiter.io.core_in <> pktize.io.net_out
+  arbiter.io.core_meta_in <> pktize.io.meta_out
+  arbiter.io.net_in <> io.net.in
+  pisa.io.net_in <> arbiter.io.net_out
+  pisa.io.meta_in <> arbiter.io.meta_out
+  split.io.net_in <> pisa.io.net_out
+  split.io.meta_in <> pisa.io.meta_out
+  io.net.out <> split.io.net_out
+  assemble.io.net_in <> split.io.core_out
+  assemble.io.meta_in <> split.io.core_meta_out
+  io.core.out <> assemble.io.net_out
 }
 
 /** An I/O Bundle for LNIC RxQueue.

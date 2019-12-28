@@ -19,7 +19,7 @@ class PISAMetaIn extends Bundle {
   val offset = UInt(16.W) // pkt offset within msg
   val lnic_src = UInt(16.W) // src context ID
 
-  override def cloneType = new PISAMetaIn.asInstanceOf[this.type]
+  override def cloneType = new PISAMetaIn().asInstanceOf[this.type]
 }
 
 class PISAMetaOut extends Bundle {
@@ -28,7 +28,7 @@ class PISAMetaOut extends Bundle {
   val lnic_dst = UInt(16.W) // dst context ID from LNIC hdr
   val msg_len = UInt(16.W)
 
-  override def cloneType = new PISAMetaOut.asInstanceOf[this.type]
+  override def cloneType = new PISAMetaOut().asInstanceOf[this.type]
 }
 
 /**
@@ -36,18 +36,18 @@ class PISAMetaOut extends Bundle {
  */
 class LNICPISAIO extends Bundle {
   val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
-  val meta_in = Flipped(Valid PISAMetaIn)
+  val meta_in = Flipped(Valid (new PISAMetaIn))
   val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
   val meta_out = Valid(new PISAMetaOut)
 
-  override def cloneType = new LNICPISAIO.asInstanceOf[this.type]
+  override def cloneType = new LNICPISAIO().asInstanceOf[this.type]
 }
 
 /**
  * LNIC PISA module.
  * Temporary placeholder for SDNet module.
  */
-class LNICPISA extends Module {
+class LNICPISA(implicit p: Parameters) extends Module {
   val io = IO(new LNICPISAIO)
   val parser = Module(new PISAParser)
   val ma = Module(new PISAMA)
@@ -121,16 +121,16 @@ class ParserMeta extends Bundle {
   val drop = Bool()
   val ingress_id = Bool()
 
-  override def cloneType = new ParserMeta.asInstanceOf[this.type]
+  override def cloneType = new ParserMeta().asInstanceOf[this.type]
 }
 
 class PISAParserIO extends Bundle {
   val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
-  val meta_in = Flipped(Valid new PISAMetaIn)
+  val meta_in = Flipped(Valid (new PISAMetaIn))
   val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
   val meta_out = Decoupled(new ParserMeta)
 
-  override def cloneType = new PISAParserIO.asInstanceOf[this.type]
+  override def cloneType = new PISAParserIO().asInstanceOf[this.type]
 }
 
 @chiselName
@@ -196,8 +196,8 @@ class PISAParser(implicit p: Parameters) extends Module {
           reg_offset := io.meta_in.bits.offset
         } .otherwise {
           // pkt from network
-          reg_eth_dst := io.net_in.bits.data(47, 0)
-          reg_eth_src := io.net_in.bits.data(63, 48) << 32
+          reg_eth_dst := io.net_in.bits.data(63, 16)
+          reg_eth_src := io.net_in.bits.data(15, 0) << 32
         }
       }
 
@@ -216,9 +216,9 @@ class PISAParser(implicit p: Parameters) extends Module {
     }
     is (sWordTwo) {
       // parsing logic
-      val eth_type = io.net_in.bits.data(47, 32)
+      val eth_type = io.net_in.bits.data(31, 16)
       when (io.net_in.valid && io.net_in.ready) {
-        reg_eth_src := reg_eth_src | io.net_in.bits.data(31, 0)
+        reg_eth_src := reg_eth_src | io.net_in.bits.data(63, 32)
       }
 
       // next state logic
@@ -226,7 +226,7 @@ class PISAParser(implicit p: Parameters) extends Module {
         when (io.net_in.bits.last) {
           clear_regs()
           state := sWordOne
-        } .elsewhen (eth_type != LNICConsts.IP_TYPE) {
+        } .elsewhen (eth_type =/= LNICConsts.IP_TYPE) {
           reg_drop := true.B
           state := sWriteMeta
         } .otherwise {
@@ -236,14 +236,14 @@ class PISAParser(implicit p: Parameters) extends Module {
     }
     is (sWordThree) {
       // parsing logic
-      val ip_proto = io.net_in.bits.data(63, 56)
+      val ip_proto = io.net_in.bits.data(7, 0)
 
       // next state logic
       when (io.net_in.valid && io.net_in.ready) {
         when (io.net_in.bits.last) {
           clear_regs()
           state := sWordOne
-        } .elsewhen (ip_proto != LNICConsts.LNIC_PROTO) {
+        } .elsewhen (ip_proto =/= LNICConsts.LNIC_PROTO) {
           reg_drop := true.B
           state := sWriteMeta
         } .otherwise {
@@ -255,7 +255,7 @@ class PISAParser(implicit p: Parameters) extends Module {
       // parsing logic
       when (io.net_in.valid && io.net_in.ready) {
         reg_ip_src := io.net_in.bits.data(47, 16)
-        reg_ip_dst := io.net_in.bits.data(63, 48) << 16
+        reg_ip_dst := io.net_in.bits.data(15, 0) << 16
       }
 
       // next state logic
@@ -271,10 +271,10 @@ class PISAParser(implicit p: Parameters) extends Module {
     is (sWordFive) {
       // parsing logic
       when (io.net_in.valid && io.net_in.ready) {
-        reg_ip_dst := reg_ip_dst | io.net_in.bits.data(15, 0)
-        reg_lnic_src := io.net_in.bits.data(31, 16)
-        reg_lnic_dst := io.net_in.bits.data(47, 32)
-        reg_msg_id := io.net_in.bits.data(63, 48)
+        reg_ip_dst := reg_ip_dst | io.net_in.bits.data(63, 48)
+        reg_lnic_src := io.net_in.bits.data(47, 32)
+        reg_lnic_dst := io.net_in.bits.data(31, 16)
+        reg_msg_id := io.net_in.bits.data(15, 0)
       }
 
       // next state logic
@@ -290,8 +290,8 @@ class PISAParser(implicit p: Parameters) extends Module {
     is (sWordSix) {
       // parsing logic
       when (io.net_in.valid && io.net_in.ready) {
-        reg_msg_len := io.net_in.bits.data(15, 0)
-        reg_offset := io.net_in.bits.data(31, 16)
+        reg_msg_len := io.net_in.bits.data(63, 48)
+        reg_offset := io.net_in.bits.data(47, 32)
       }
 
       // next state logic
@@ -362,7 +362,7 @@ class MAMeta extends ParserMeta {
   val egress_id = Bool()
   val ip_chksum = UInt(16.W)
 
-  override def cloneType = new MAMeta.asInstanceOf[this.type]
+  override def cloneType = new MAMeta().asInstanceOf[this.type]
 }
 
 class PISAMAIO extends Bundle {
@@ -371,7 +371,7 @@ class PISAMAIO extends Bundle {
   val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
   val meta_out = Decoupled(new MAMeta)
 
-  override def cloneType = new PISAMAIO.asInstanceOf[this.type]
+  override def cloneType = new PISAMAIO().asInstanceOf[this.type]
 }
 
 @chiselName
@@ -437,6 +437,7 @@ class PISAMA(implicit p: Parameters) extends Module {
           } .otherwise {
             state := sWaitStart
           }
+        }
       }
     }
     is (sWaitStart) {
@@ -462,7 +463,6 @@ class PISAMA(implicit p: Parameters) extends Module {
       }
     }
   }
-
 }
 
 /**
@@ -482,7 +482,7 @@ class PISADeparserIO extends Bundle {
   val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
   val meta_out = Valid(new PISAMetaOut)
 
-  override def cloneType = new PISADeparserIO.asInstanceOf[this.type]
+  override def cloneType = new PISADeparserIO().asInstanceOf[this.type]
 }
 
 @chiselName
@@ -578,8 +578,8 @@ class PISADeparser(implicit p: Parameters) extends Module {
     }
     is (sWordThree) {
       // ip_len (2B) ++ ip_id (2B) ++ ip_flags (3 bits) ++ ip_frag (13 bits) ++ ip_ttl (1B) ++ ip_proto (1B)
-      val msg_len_plus_hdr = metaQueue_out.msg_len + 20.U
-      val ip_len = Mux(msg_len_plus_hdr < LNICConsts.MAX_ETH_BYTES.U, msg_len_plus_hdr, (LNICConsts.MAX_ETH_BYTES.U - 20.U))
+      val msg_len_plus_hdr = metaQueue_out.bits.msg_len + 20.U
+      val ip_len = Mux(msg_len_plus_hdr < LNICConsts.ETH_MAX_BYTES.U, msg_len_plus_hdr, (LNICConsts.ETH_MAX_BYTES.U - 20.U))
       val ip_id = 1.U(16.W)
       val ip_flags = 0.U(3.W)
       val ip_frag = 0.U(13.W)
@@ -589,18 +589,18 @@ class PISADeparser(implicit p: Parameters) extends Module {
     }
     is (sWordFour) {
       // ip_chksum (2B) ++ ip_src (4B) ++ ip_dst (2B)
-      write_hdr_word(Cat(metaQueue_out.ip_chksum, metaQueue_out.ip_src, metaQueue_out.ip_dst(31, 16)), sWordFour)
+      write_hdr_word(Cat(metaQueue_out.bits.ip_chksum, metaQueue_out.bits.ip_src, metaQueue_out.bits.ip_dst(31, 16)), sWordFive)
     }
     is (sWordFive) {
       // ip_dst (2B) ++ lnic_src (2B) ++ lnic_dst (2B) ++ lnic_msg_id (2B)
-      write_hdr_word(Cat(metaQueue_out.ip_dst(15, 0),
-                         metaQueue_out.lnic_src,
-                         metaQueue_out.lnic_dst,
-                         metaQueue_out.msg_id), sWordFour)
+      write_hdr_word(Cat(metaQueue_out.bits.ip_dst(15, 0),
+                         metaQueue_out.bits.lnic_src,
+                         metaQueue_out.bits.lnic_dst,
+                         metaQueue_out.bits.msg_id), sWordSix)
     }
     is (sWordSix) {
       // lnic_msg_len (2B) ++ lnic_offset (2B) ++ lnic_padding (4B)
-      write_hdr_word(Cat(metaQueue_out.msg_len, metaQueue_out.offset, 0.U(32.W)), sWritePkt)
+      write_hdr_word(Cat(metaQueue_out.bits.msg_len, metaQueue_out.bits.offset, 0.U(32.W)), sWritePkt)
     }
     is (sWritePkt) {
       // Connect net_out to pktQueue_out and wait until last word is transferred, then transfer to sWordOne
@@ -637,7 +637,7 @@ class PISADeparser(implicit p: Parameters) extends Module {
   // read metaQueue on the last word of pkt
   metaQueue_out.ready := pktQueue_out.valid && pktQueue_out.ready && pktQueue_out.bits.last
 
-  def write_hdr_word (pktData, nextState) = {
+  def write_hdr_word (pktData: UInt, nextState: UInt) = {
     when (pktQueue_out.valid && metaQueue_out.valid) {
       io.net_out.valid := true.B
       io.net_out.bits.data := pktData
