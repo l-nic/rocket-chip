@@ -4,7 +4,7 @@ package freechips.rocketchip.tile
 import Chisel._
 
 import chisel3.{chiselTypeOf, WireDefault}
-import chisel3.util.{EnqIO, DeqIO}
+import chisel3.util.{EnqIO, DeqIO, HasBlackBoxResource}
 import chisel3.experimental._
 import freechips.rocketchip.config._
 import freechips.rocketchip.subsystem._
@@ -39,8 +39,8 @@ object LNICConsts {
   val IP_TYPE = 0x800.U(16.W)
   val LNIC_PROTO = 0x99.U(8.W)
 
-  val SWITCH_MAC_ADDR = "h081122334408".U
-  val NIC_MAC_ADDR = "h085566778808".U
+  val SWITCH_MAC_ADDR = "h085566778808".U
+  val NIC_MAC_ADDR = "h081122334408".U
   val NIC_IP_ADDR = "h11223344".U
 }
 
@@ -49,8 +49,6 @@ case class LNICParams(
   usingGPRs: Boolean = false,
   rxQueueFlits: Int = 16,
   txQueueFlits: Int = 16,
-//  inBufFlits: Int  = 2 * LNICConsts.ETH_MAX_BYTES / LNICConsts.NET_IF_BYTES,
-//  outBufFlits: Int = 2 * LNICConsts.ETH_MAX_BYTES / LNICConsts.NET_IF_BYTES,
   pktizePktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
   arbiterPktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
   arbiterMetaBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
@@ -322,6 +320,15 @@ trait HasLNICModuleImp extends LazyModuleImp with HasTileParameters {
     }
   }
 
+  def connectSimNetwork(clock: Clock, reset: Bool) {
+    netPorts.foreach { net =>
+      val sim = Module(new SimNetwork)
+      sim.io.clock := clock
+      sim.io.reset := reset
+      sim.io.net <> net
+    }
+  }
+
   def connectPktGen(pktLen: Int = 64) {
     netPorts.foreach { net =>
       val pktGen = Module(new PktGen(pktLen))
@@ -333,6 +340,22 @@ trait HasLNICModuleImp extends LazyModuleImp with HasTileParameters {
 }
 
 /* Test Modules */
+
+class SimNetwork extends BlackBox with HasBlackBoxResource {
+  val io = IO(new Bundle {
+    val clock = Input(Clock())
+    val reset = Input(Bool())
+    val net = Flipped(new LNICNetIO)
+  })
+
+  addResource("/vsrc/SimNetwork.v")
+  addResource("/csrc/SimNetwork.cc")
+  addResource("/csrc/switch.h")
+  addResource("/csrc/switch.cc")
+  addResource("/csrc/device.h")
+  addResource("/csrc/device.cc")
+  addResource("/csrc/packet.h")
+}
 
 class PktGen (pktLen: Int = 64) extends Module {
   val io = IO(new Bundle {
@@ -389,8 +412,6 @@ class PktGen (pktLen: Int = 64) extends Module {
       }
     }
   }
-
-
 }
 
 
