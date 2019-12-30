@@ -10,11 +10,13 @@ import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.rocket._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util._
+import NetworkHelpers._
 
 /**
  * LNIC Pktization Buffer classes.
  *
  * Tasks:
+ *   - Reverse byte order of words coming from CPU
  *   - Consume messages from the CPU and transform into pkts
  *   - For now, assume all msgs consist of one pkt
  */
@@ -38,7 +40,12 @@ class PktizeIO extends Bundle {
 class LNICPktize(implicit p: Parameters) extends Module {
   val io = IO(new PktizeIO)
 
-  io.net_out <> Queue(io.net_in, p(LNICKey).pktizePktBufFlits)
+  val pktQueue_in = Wire(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
+  pktQueue_in <> io.net_in
+  // reverse byte order of words coming from CPU
+  pktQueue_in.bits.data := reverse_bytes(io.net_in.bits.data, LNICConsts.NET_IF_BYTES)
+
+  io.net_out <> Queue(pktQueue_in, p(LNICKey).pktizePktBufFlits)
 
   // state machine to drive io.meta_out
   val sWordOne :: sWaitEnd :: Nil = Enum(2)
@@ -266,7 +273,8 @@ class LNICSplit(implicit p: Parameters) extends Module {
  * LNIC Assemble classes.
  *
  * Tasks:
- *   - Reassemble pkts going to CPU into messages.
+ *   - Reassemble pkts going to CPU into messages
+ *   - Reverse byte order of data going to CPU
  *   - Enforce message length
  *   - For now, assume all msgs consist of a single pkt and there is only one thread running on the core
  */
@@ -289,6 +297,8 @@ class LNICAssemble(implicit p: Parameters) extends Module {
 
   // default - connect net_in to pktQueue
   pktQueue_in <> io.net_in
+  // reverse byte order of data going to CPU
+  pktQueue_in.bits.data := reverse_bytes(io.net_in.bits.data, LNICConsts.NET_IF_BYTES)
 
   // state machine to compute message length using pktQueue_in
   val sStart :: sEnd :: Nil = Enum(2)
@@ -327,6 +337,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
           // msg is too short - need to pad it
           state := sPad
           pktQueue_in.bits.last := false.B
+          pktQueue_in.bits.keep := LNICConsts.NET_FULL_KEEP
         } .elsewhen (reg_msg_len <= LNICConsts.NET_IF_BYTES.U && !io.net_in.bits.last) {
           // msg is too long - need to truncate it
           state := sTruncate
@@ -346,18 +357,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
       when (io.net_in.valid && io.net_in.ready && reg_msg_len <= LNICConsts.NET_IF_BYTES.U) {
         state := sIdle
         pktQueue_in.bits.last := true.B
-        // TODO(sibanez): parameterize this
-        switch(reg_msg_len) {
-          is (0.U) { pktQueue_in.bits.keep := "b00000000".U }
-          is (1.U) { pktQueue_in.bits.keep := "b00000001".U }
-          is (2.U) { pktQueue_in.bits.keep := "b00000011".U }
-          is (3.U) { pktQueue_in.bits.keep := "b00000111".U }
-          is (4.U) { pktQueue_in.bits.keep := "b00001111".U }
-          is (5.U) { pktQueue_in.bits.keep := "b00011111".U }
-          is (6.U) { pktQueue_in.bits.keep := "b00111111".U }
-          is (7.U) { pktQueue_in.bits.keep := "b01111111".U }
-          is (8.U) { pktQueue_in.bits.keep := "b11111111".U }
-        }
+        pktQueue_in.bits.keep := (1.U << reg_msg_len) - 1.U
       }
     }
   }

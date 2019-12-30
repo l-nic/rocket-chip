@@ -44,6 +44,13 @@ object LNICConsts {
   val NIC_IP_ADDR = "h11223344".U
 }
 
+object NetworkHelpers {
+  def reverse_bytes(a: UInt, n: Int) = {
+    val bytes = (0 until n).map(i => a((i + 1) * 8 - 1, i * 8))
+    Cat(bytes)
+  }
+}
+
 case class LNICParams(
   usingLNIC: Boolean = false,
   usingGPRs: Boolean = false,

@@ -10,6 +10,7 @@ import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.rocket._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util._
+import NetworkHelpers._
 
 class PISAMetaIn extends Bundle {
   val ingress_id = Bool() // 0 = network, 1 = CPU
@@ -188,16 +189,16 @@ class PISAParser(implicit p: Parameters) extends Module {
         reg_ingress_id := io.meta_in.bits.ingress_id
         when (io.meta_in.bits.ingress_id) {
           // pkt from CPU
-          reg_ip_dst := io.net_in.bits.data(63, 32)
+          reg_ip_dst := reverse_bytes(io.net_in.bits.data(31, 0), 4)
           reg_lnic_src := io.meta_in.bits.lnic_src
-          reg_lnic_dst := io.net_in.bits.data(31, 16)
+          reg_lnic_dst := reverse_bytes(io.net_in.bits.data(47, 32), 2)
           reg_msg_id := io.meta_in.bits.msg_id
-          reg_msg_len := io.net_in.bits.data(15, 0)
+          reg_msg_len := reverse_bytes(io.net_in.bits.data(63, 48), 2)
           reg_offset := io.meta_in.bits.offset
         } .otherwise {
           // pkt from network
-          reg_eth_dst := io.net_in.bits.data(63, 16)
-          reg_eth_src := io.net_in.bits.data(15, 0) << 32
+          reg_eth_dst := reverse_bytes(io.net_in.bits.data(47, 0), 6)
+          reg_eth_src := reverse_bytes(io.net_in.bits.data(63, 48), 2) << 32
         }
       }
 
@@ -216,9 +217,9 @@ class PISAParser(implicit p: Parameters) extends Module {
     }
     is (sWordTwo) {
       // parsing logic
-      val eth_type = io.net_in.bits.data(31, 16)
+      val eth_type = reverse_bytes(io.net_in.bits.data(47, 32), 2)
       when (io.net_in.valid && io.net_in.ready) {
-        reg_eth_src := reg_eth_src | io.net_in.bits.data(63, 32)
+        reg_eth_src := reg_eth_src | reverse_bytes(io.net_in.bits.data(31, 0), 4)
       }
 
       // next state logic
@@ -236,7 +237,7 @@ class PISAParser(implicit p: Parameters) extends Module {
     }
     is (sWordThree) {
       // parsing logic
-      val ip_proto = io.net_in.bits.data(7, 0)
+      val ip_proto = io.net_in.bits.data(63, 56)
 
       // next state logic
       when (io.net_in.valid && io.net_in.ready) {
@@ -254,8 +255,8 @@ class PISAParser(implicit p: Parameters) extends Module {
     is (sWordFour) {
       // parsing logic
       when (io.net_in.valid && io.net_in.ready) {
-        reg_ip_src := io.net_in.bits.data(47, 16)
-        reg_ip_dst := io.net_in.bits.data(15, 0) << 16
+        reg_ip_src := reverse_bytes(io.net_in.bits.data(47, 16), 4)
+        reg_ip_dst := reverse_bytes(io.net_in.bits.data(63, 48), 2) << 16
       }
 
       // next state logic
@@ -271,10 +272,10 @@ class PISAParser(implicit p: Parameters) extends Module {
     is (sWordFive) {
       // parsing logic
       when (io.net_in.valid && io.net_in.ready) {
-        reg_ip_dst := reg_ip_dst | io.net_in.bits.data(63, 48)
-        reg_lnic_src := io.net_in.bits.data(47, 32)
-        reg_lnic_dst := io.net_in.bits.data(31, 16)
-        reg_msg_id := io.net_in.bits.data(15, 0)
+        reg_ip_dst := reg_ip_dst | reverse_bytes(io.net_in.bits.data(15, 0), 2)
+        reg_lnic_src := reverse_bytes(io.net_in.bits.data(31, 16), 2)
+        reg_lnic_dst := reverse_bytes(io.net_in.bits.data(47, 32), 2)
+        reg_msg_id := reverse_bytes(io.net_in.bits.data(63, 48), 2)
       }
 
       // next state logic
@@ -290,8 +291,8 @@ class PISAParser(implicit p: Parameters) extends Module {
     is (sWordSix) {
       // parsing logic
       when (io.net_in.valid && io.net_in.ready) {
-        reg_msg_len := io.net_in.bits.data(63, 48)
-        reg_offset := io.net_in.bits.data(47, 32)
+        reg_msg_len := reverse_bytes(io.net_in.bits.data(15, 0), 2)
+        reg_offset := reverse_bytes(io.net_in.bits.data(31, 16), 2)
       }
 
       // next state logic
@@ -550,9 +551,9 @@ class PISADeparser(implicit p: Parameters) extends Module {
           io.meta_out.bits.msg_len := metaQueue_out.bits.msg_len
           io.net_out.bits.data := Mux (metaQueue_out.bits.egress_id,
             // pkt going to CPU
-            Cat(metaQueue_out.bits.ip_src, metaQueue_out.bits.lnic_src, metaQueue_out.bits.msg_len),
+            Cat(reverse_bytes(metaQueue_out.bits.msg_len, 2), reverse_bytes(metaQueue_out.bits.lnic_src, 2), reverse_bytes(metaQueue_out.bits.ip_src, 4)),
             // pkt going to network
-            Cat(metaQueue_out.bits.eth_dst, metaQueue_out.bits.eth_src(47, 32)))
+            Cat(reverse_bytes(metaQueue_out.bits.eth_src(47, 32), 2), reverse_bytes(metaQueue_out.bits.eth_dst, 6)))
           // If net_out.ready is not set, fill out regs and transfer to sHoldRegs, otherwise transfer to either sWritePkt or sWordTwo
           when (!io.net_out.ready) {
             state := sHoldRegs
@@ -637,10 +638,13 @@ class PISADeparser(implicit p: Parameters) extends Module {
   // read metaQueue on the last word of pkt
   metaQueue_out.ready := pktQueue_out.valid && pktQueue_out.ready && pktQueue_out.bits.last
 
+  // helper method to write a word
+  // NOTE: byte order is reverse when it's put on the wire.
+  // So most significant byte of pktData input should be on the left
   def write_hdr_word (pktData: UInt, nextState: UInt) = {
     when (pktQueue_out.valid && metaQueue_out.valid) {
       io.net_out.valid := true.B
-      io.net_out.bits.data := pktData
+      io.net_out.bits.data := reverse_bytes(pktData, LNICConsts.NET_IF_BYTES)
       io.net_out.bits.keep := LNICConsts.NET_FULL_KEEP
       io.net_out.bits.last := false.B
       when (!io.net_out.ready) {

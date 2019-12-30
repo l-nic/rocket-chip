@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 
-#define NET_IP_ALIGN 2
+#define NET_IP_ALIGN 0
 #define ETH_MAX_WORDS 190
 #define ETH_MAX_BYTES 1518
 #define MAC_ADDR_BYTES 6
