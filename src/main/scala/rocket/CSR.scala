@@ -790,7 +790,7 @@ class CSRFile(
     /****************************************/
     /* LNIC txQueue_in.bits.last/keep logic */
     /****************************************/
-    val txMsgLen = RegInit(0.U(64.W))
+    val txMsgLen = RegInit(0.U(16.W))
     val sTxWaitFirstWord :: sTxWaitLastWord :: Nil = Enum(2)
     val txMsgState = RegInit(sTxWaitFirstWord)
 
@@ -798,7 +798,7 @@ class CSRFile(
       is (sTxWaitFirstWord) {
         when (txQueue_in.get.valid && txQueue_in.get.ready) {
           // record msg length
-          txMsgLen := txQueue_in.get.bits.data
+          txMsgLen := txQueue_in.get.bits.data(15, 0)
           txMsgState := sTxWaitLastWord
         }
       }
@@ -808,18 +808,7 @@ class CSRFile(
             txMsgLen := txMsgLen - LNICConsts.NET_IF_BYTES.U
           }.otherwise {
             txQueue_in.get.bits.last := true.B
-            // TODO(sibanez): make this parameterizable
-            switch(txMsgLen) {
-              is (0.U) { txQueue_in.get.bits.keep := "b00000000".U }
-              is (1.U) { txQueue_in.get.bits.keep := "b00000001".U }
-              is (2.U) { txQueue_in.get.bits.keep := "b00000011".U }
-              is (3.U) { txQueue_in.get.bits.keep := "b00000111".U }
-              is (4.U) { txQueue_in.get.bits.keep := "b00001111".U }
-              is (5.U) { txQueue_in.get.bits.keep := "b00011111".U }
-              is (6.U) { txQueue_in.get.bits.keep := "b00111111".U }
-              is (7.U) { txQueue_in.get.bits.keep := "b01111111".U }
-              is (8.U) { txQueue_in.get.bits.keep := "b11111111".U }
-            }
+            txQueue_in.get.bits.keep := (1.U << txMsgLen) - 1.U
             txMsgLen := 0.U
             txMsgState := sTxWaitFirstWord
           }

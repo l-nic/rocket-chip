@@ -5,7 +5,8 @@
 #include "switch.h"
 
 // TODO(sibanez): consolidate with LNICConsts
-#define NIC_MAC_ADDR 0x081122334408
+// NOTE: the byte order is reversed here ...
+#define NIC_MAC_ADDR 0x084433221108
 
 class NetworkSwitch *netsw = NULL;
 class NetworkDevice *netdev = NULL;

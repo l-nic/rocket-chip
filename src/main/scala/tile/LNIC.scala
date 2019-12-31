@@ -23,7 +23,7 @@ object LNICConsts {
   val ETH_HEAD_BYTES = 16
   val ETH_MAC_BITS = 48
   val ETH_TYPE_BITS = 16
-  val ETH_PAD_BITS = 16
+  val ETH_PAD_BITS = 16 // TODO(sibanez): what is this?? remove?
 
   val ETH_MAX_FLITS = ETH_MAX_BYTES/NET_IF_BYTES
   val ETH_MIN_FLITS = ETH_MIN_BYTES/NET_IF_BYTES
@@ -38,10 +38,11 @@ object LNICConsts {
 
   val IP_TYPE = 0x800.U(16.W)
   val LNIC_PROTO = 0x99.U(8.W)
+  val LNIC_HDR_BYTES = 14
 
   val SWITCH_MAC_ADDR = "h085566778808".U
   val NIC_MAC_ADDR = "h081122334408".U
-  val NIC_IP_ADDR = "h11223344".U
+  val NIC_IP_ADDR = "h0A000001".U // 10.0.0.1
 }
 
 object NetworkHelpers {
@@ -327,6 +328,12 @@ trait HasLNICModuleImp extends LazyModuleImp with HasTileParameters {
     }
   }
 
+  // Connect core to simulated network.
+  // TODO: maybe insert a module between the core and network that inserts
+  //   timestamps into application payload to compute latency?
+  //   Maybe if the LNIC src context ID == 0 then insert timestamp at the
+  //   specified word offset. But then it's only measuring latency from
+  //   first word to first word.
   def connectSimNetwork(clock: Clock, reset: Bool) {
     netPorts.foreach { net =>
       val sim = Module(new SimNetwork)

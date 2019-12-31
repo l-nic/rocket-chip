@@ -116,7 +116,7 @@ class ParserMeta extends Bundle {
   val ip_dst = UInt(32.W)
   val lnic_src = UInt(16.W)
   val lnic_dst = UInt(16.W)
-  val msg_id = UInt(32.W)
+  val msg_id = UInt(16.W)
   val msg_len = UInt(16.W)
   val offset = UInt(16.W)
   val drop = Bool()
@@ -154,7 +154,7 @@ class PISAParser(implicit p: Parameters) extends Module {
   val reg_ip_dst = RegInit(0.U(32.W))
   val reg_lnic_src = RegInit(0.U(16.W))
   val reg_lnic_dst = RegInit(0.U(16.W))
-  val reg_msg_id = RegInit(0.U(32.W))
+  val reg_msg_id = RegInit(0.U(16.W))
   val reg_msg_len = RegInit(0.U(16.W))
   val reg_offset = RegInit(0.U(16.W))
   val reg_drop = RegInit(false.B)
@@ -579,8 +579,8 @@ class PISADeparser(implicit p: Parameters) extends Module {
     }
     is (sWordThree) {
       // ip_len (2B) ++ ip_id (2B) ++ ip_flags (3 bits) ++ ip_frag (13 bits) ++ ip_ttl (1B) ++ ip_proto (1B)
-      val msg_len_plus_hdr = metaQueue_out.bits.msg_len + 20.U
-      val ip_len = Mux(msg_len_plus_hdr < LNICConsts.ETH_MAX_BYTES.U, msg_len_plus_hdr, (LNICConsts.ETH_MAX_BYTES.U - 20.U))
+      val msg_len_plus_hdr = metaQueue_out.bits.msg_len + 20.U + LNICConsts.LNIC_HDR_BYTES.U
+      val ip_len = Mux(msg_len_plus_hdr < LNICConsts.ETH_MAX_BYTES.U, msg_len_plus_hdr, (LNICConsts.ETH_MAX_BYTES.U - 20.U - LNICConsts.LNIC_HDR_BYTES.U))
       val ip_id = 1.U(16.W)
       val ip_flags = 0.U(3.W)
       val ip_frag = 0.U(13.W)
@@ -642,9 +642,13 @@ class PISADeparser(implicit p: Parameters) extends Module {
   // NOTE: byte order is reverse when it's put on the wire.
   // So most significant byte of pktData input should be on the left
   def write_hdr_word (pktData: UInt, nextState: UInt) = {
+    val net_data = pktData
+    val net_data_rvs = reverse_bytes(pktData, LNICConsts.NET_IF_BYTES)
+    dontTouch(net_data)
+    dontTouch(net_data_rvs)
     when (pktQueue_out.valid && metaQueue_out.valid) {
       io.net_out.valid := true.B
-      io.net_out.bits.data := reverse_bytes(pktData, LNICConsts.NET_IF_BYTES)
+      io.net_out.bits.data := net_data_rvs
       io.net_out.bits.keep := LNICConsts.NET_FULL_KEEP
       io.net_out.bits.last := false.B
       when (!io.net_out.ready) {
