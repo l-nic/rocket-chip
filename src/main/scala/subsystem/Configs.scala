@@ -42,7 +42,7 @@ class BaseSubsystemConfig extends Config ((site, here, up) => {
   case DebugModuleParams => DefaultDebugModuleParams(site(XLen))
   case CLINTKey => Some(CLINTParams())
   case PLICKey => Some(PLICParams())
-  case LNICKey => LNICParams()
+  case LNICKey => LNICParams(usingLNIC = false)
 })
 
 /* Composable partial function Configs to set individual parameters */
