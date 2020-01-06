@@ -274,7 +274,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       val ex_lnic_undo = ex_reg_lnic_ren.get && ctrl_killx && ex_reg_valid
       val mem_lnic_undo = mem_reg_lnic_ren.get && ctrl_killm && mem_reg_valid
       csr.io.rx_undo.get.valid := ex_lnic_undo || mem_lnic_undo
-      csr.io.rx_undo.get.bits := ex_lnic_undo.asUInt + mem_lnic_undo.asUInt
+      csr.io.rx_undo.get.bits := Cat(ex_lnic_undo, mem_lnic_undo)
     }
 
     // Connect CSRFile network IO to RocketCore IO

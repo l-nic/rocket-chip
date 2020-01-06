@@ -258,10 +258,10 @@ class LNICRxQueue[T <: Data](gen: T,
     }
   } .elsewhen (io.unread.valid) {
     // perform an unread operation (up to two words)
-    when (io.unread.bits === 2.U) {
+    when (io.unread.bits.andR) { // both bits set
       deq_ptr := deq_ptr_minus2
       deq_ptr_minus1 := deq_ptr_minus2
-    } .elsewhen (io.unread.bits === 1.U) {
+    } .elsewhen (io.unread.bits.orR) { // at least one of the bits is set
       deq_ptr := deq_ptr_minus1
     }
   }
