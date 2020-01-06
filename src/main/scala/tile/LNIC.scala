@@ -226,19 +226,21 @@ class LNICRxQueue[T <: Data](gen: T,
   require(isPow2(entries), "LNICRxQueue requires a power of 2 number of entries!")
   val io = IO(new LNICRxQueueIO(genType, entries))
 
-  private val ram = Mem(entries, genType)
-  private val enq_ptr = RegInit(0.U(log2Ceil(entries).W))
-  private val deq_ptr = RegInit(0.U(log2Ceil(entries).W))
-  private val deq_ptr_minus1 = RegInit(0.U(log2Ceil(entries).W))
-  private val deq_ptr_minus2 = RegInit(0.U(log2Ceil(entries).W))
-  private val maybe_full = RegInit(false.B)
+  val ram = Mem(entries, genType)
+  val enq_ptr = RegInit(2.U(log2Ceil(entries).W))
+  val deq_ptr = RegInit(2.U(log2Ceil(entries).W))
+  val deq_ptr_minus1 = RegInit(1.U(log2Ceil(entries).W))
+  val deq_ptr_minus2 = RegInit(0.U(log2Ceil(entries).W))
 
-  private val ptr_match_full = enq_ptr === deq_ptr_minus2
-  private val ptr_match_empty = enq_ptr === deq_ptr
-  private val empty = ptr_match_empty && !maybe_full
-  private val full = ptr_match_full && maybe_full
-  private val do_enq = WireDefault(io.enq.fire())
-  private val do_deq = WireDefault(io.deq.fire())
+  // if enq_ptr === deq_ptr_minus2 then the queue is full no questions asked
+  val ptr_match_full = enq_ptr === deq_ptr_minus2
+  // if enq_ptr === deq_ptr then the queue may be empty (deq_ptr caught up to enq_ptr)
+  //   or the queue was full and received 2 undo operations
+  val ptr_match_empty = enq_ptr === deq_ptr
+  val full = ptr_match_full
+  val empty = ptr_match_empty && !ptr_match_full
+  val do_enq = WireDefault(io.enq.fire())
+  val do_deq = WireDefault(io.deq.fire())
 
   when (do_enq) {
     ram(enq_ptr) := io.enq.bits
@@ -250,9 +252,9 @@ class LNICRxQueue[T <: Data](gen: T,
     deq_ptr := deq_ptr + 1.U
     when (deq_ptr_minus1 =/= deq_ptr) {
       deq_ptr_minus1 := deq_ptr_minus1 + 1.U
-    }
-    when(deq_ptr_minus2 =/= deq_ptr_minus1) {
-      deq_ptr_minus2 := deq_ptr_minus2 + 1.U
+      when (deq_ptr_minus2 =/= deq_ptr_minus1) {
+        deq_ptr_minus2 := deq_ptr_minus2 + 1.U
+      }
     }
   } .elsewhen (io.unread.valid) {
     // perform an unread operation (up to two words)
@@ -262,10 +264,6 @@ class LNICRxQueue[T <: Data](gen: T,
     } .elsewhen (io.unread.bits === 1.U) {
       deq_ptr := deq_ptr_minus1
     }
-  }
-
-  when (do_enq =/= do_deq) {
-    maybe_full := do_enq
   }
 
   io.deq.valid := !empty
