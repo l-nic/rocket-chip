@@ -5,12 +5,12 @@ package freechips.rocketchip.rocket
 
 import Chisel._
 import freechips.rocketchip.config.Parameters
-import freechips.rocketchip.tile.CoreModule
+import freechips.rocketchip.tile.{CoreModule, NetworkHelpers}
 
 object ALU
 {
-  val SZ_ALU_FN = 4
-  def FN_X    = BitPat("b????")
+  val SZ_ALU_FN = 5
+  def FN_X    = BitPat("b?????")
   def FN_ADD  = UInt(0)
   def FN_SL   = UInt(1)
   def FN_SEQ  = UInt(2)
@@ -25,6 +25,9 @@ object ALU
   def FN_SGE  = UInt(13)
   def FN_SLTU = UInt(14)
   def FN_SGEU = UInt(15)
+  def FN_REVS = UInt(16)
+  def FN_REVI = UInt(17)
+  def FN_REVL = UInt(18)
 
   def FN_DIV  = FN_XOR
   def FN_DIVU = FN_SR
@@ -91,7 +94,15 @@ class ALU(implicit p: Parameters) extends CoreModule()(p) {
   val shift_logic = (isCmp(io.fn) && slt) | logic | shout
   val out = Mux(io.fn === FN_ADD || io.fn === FN_SUB, io.adder_out, shift_logic)
 
-  io.out := out
+  // REVS, REVI, REVL
+  val final_out = Mux(io.fn === FN_REVS, Cat(io.in1(63, 16), NetworkHelpers.reverse_bytes(io.in1(15, 0), 2)),
+                    Mux(io.fn === FN_REVI, Cat(io.in1(63, 32), NetworkHelpers.reverse_bytes(io.in1(31, 0), 4)),
+                      Mux(io.fn === FN_REVL, NetworkHelpers.reverse_bytes(io.in1, 8), out)))
+//  val final_out = Mux((io.fn === FN_REVS) && (io.dw === DW_64), Cat(io.in1(63, 16), NetworkHelpers.reverse_bytes(io.in1(15, 0), 2)),
+//                    Mux((io.fn === FN_REVI) && (io.dw === DW_64), Cat(io.in1(63, 32), NetworkHelpers.reverse_bytes(io.in1(31, 0), 4)),
+//                      Mux((io.fn === FN_REVL) && (io.dw === DW_64), NetworkHelpers.reverse_bytes(io.in1, 8), out)))
+
+  io.out := final_out
   if (xLen > 32) {
     require(xLen == 64)
     when (io.dw === DW_32) { io.out := Cat(Fill(32, out(31)), out(31,0)) }
