@@ -20,10 +20,9 @@ object LNICConsts {
 
   val ETH_MAX_BYTES = 1520
   val ETH_MIN_BYTES = 64
-  val ETH_HEAD_BYTES = 16
+  val ETH_HEAD_BYTES = 14
   val ETH_MAC_BITS = 48
   val ETH_TYPE_BITS = 16
-  val ETH_PAD_BITS = 16 // TODO(sibanez): what is this?? remove?
 
   val ETH_MAX_FLITS = ETH_MAX_BYTES/NET_IF_BYTES
   val ETH_MIN_FLITS = ETH_MIN_BYTES/NET_IF_BYTES
@@ -39,8 +38,10 @@ object LNICConsts {
   val IP_TYPE = 0x800.U(16.W)
   val LNIC_PROTO = 0x99.U(8.W)
   val LNIC_HDR_BYTES = 14
+  val LNIC_CONTEXT_BITS = 16
 
-  val TEST_CONTEXT_ID = 0x1234.U(16.W)
+  val LNIC_PRIORITY_BITS = 8
+  val TEST_CONTEXT_ID = 0x1234.U(LNIC_CONTEXT_BITS.W)
 
   val SWITCH_MAC_ADDR = "h085566778808".U
   val NIC_MAC_ADDR = "h081122334408".U
@@ -63,6 +64,7 @@ case class LNICParams(
   arbiterPktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
   arbiterMetaBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
   assemblePktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
+  assembleMetaBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
   parserPktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
   parserMetaBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
   maPktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,

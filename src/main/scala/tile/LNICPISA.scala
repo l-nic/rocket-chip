@@ -18,7 +18,7 @@ class PISAMetaIn extends Bundle {
   /* metadata for pkts from CPU only (set by pktization buffer) */
   val msg_id = UInt(16.W)
   val offset = UInt(16.W) // pkt offset within msg
-  val lnic_src = UInt(16.W) // src context ID
+  val lnic_src = UInt(LNICConsts.LNIC_CONTEXT_BITS.W) // src context ID
 
   override def cloneType = new PISAMetaIn().asInstanceOf[this.type]
 }
@@ -26,7 +26,7 @@ class PISAMetaIn extends Bundle {
 class PISAMetaOut extends Bundle {
   val egress_id = Bool() // 0 = network, 1 = CPU
   /* metadata for pkt going to CPU */
-  val lnic_dst = UInt(16.W) // dst context ID from LNIC hdr
+  val lnic_dst = UInt(LNICConsts.LNIC_CONTEXT_BITS.W) // dst context ID from LNIC hdr
   val msg_len = UInt(16.W)
 
   override def cloneType = new PISAMetaOut().asInstanceOf[this.type]
@@ -114,8 +114,8 @@ class ParserMeta extends Bundle {
   val ip_src = UInt(32.W)
   /* metadata for both pkts from CPU and network */
   val ip_dst = UInt(32.W)
-  val lnic_src = UInt(16.W)
-  val lnic_dst = UInt(16.W)
+  val lnic_src = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
+  val lnic_dst = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
   val msg_id = UInt(16.W)
   val msg_len = UInt(16.W)
   val offset = UInt(16.W)
@@ -152,8 +152,8 @@ class PISAParser(implicit p: Parameters) extends Module {
   val reg_ip_src = RegInit(0.U(32.W))
   /* metadata for both pkts from CPU and network */
   val reg_ip_dst = RegInit(0.U(32.W))
-  val reg_lnic_src = RegInit(0.U(16.W))
-  val reg_lnic_dst = RegInit(0.U(16.W))
+  val reg_lnic_src = RegInit(0.U(LNICConsts.LNIC_CONTEXT_BITS.W))
+  val reg_lnic_dst = RegInit(0.U(LNICConsts.LNIC_CONTEXT_BITS.W))
   val reg_msg_id = RegInit(0.U(16.W))
   val reg_msg_len = RegInit(0.U(16.W))
   val reg_offset = RegInit(0.U(16.W))
@@ -517,8 +517,8 @@ class PISADeparser(implicit p: Parameters) extends Module {
   val reg_data = RegInit(0.U(LNICConsts.NET_IF_WIDTH))
   val reg_meta_out_valid = RegInit(false.B)
   val reg_egress_id = RegInit(false.B)
-  val reg_lnic_dst = RegInit(0.U(16.W))
-  val reg_msg_len = RegInit(0.U(16.W))
+  val reg_lnic_dst = RegInit(0.U(LNICConsts.LNIC_CONTEXT_BITS.W))
+  val reg_msg_len = RegInit(0.U(LNICConsts.LNIC_CONTEXT_BITS.W))
   val reg_next_state = RegInit(sWordOne) // only used for sHoldRegs state (i.e. back pressure)
 
   switch (state) {

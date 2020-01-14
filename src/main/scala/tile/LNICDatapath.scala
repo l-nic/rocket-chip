@@ -282,6 +282,7 @@ class AssembleIO extends Bundle {
   val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
   val meta_in = Flipped(Valid(new PISAMetaOut))
   val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
+  val meta_out = Valid(new PISAMetaOut)
 
   override def cloneType = new AssembleIO().asInstanceOf[this.type]
 }
@@ -291,9 +292,11 @@ class LNICAssemble(implicit p: Parameters) extends Module {
   val io = IO(new AssembleIO)
 
   val pktQueue_in = Wire(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
+  val metaQueue_out = Wire(Flipped(Decoupled(new PISAMetaOut)))
 
   io.net_out <> Queue(pktQueue_in, p(LNICKey).assemblePktBufFlits)
   io.net_in.ready := pktQueue_in.ready
+  metaQueue_out <> Queue(io.meta_in, p(LNICKey).assembleMetaBufFlits)
 
   // default - connect net_in to pktQueue
   pktQueue_in <> io.net_in
@@ -354,7 +357,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
     is (sPad) {
       pktQueue_in.valid := true.B
       pktQueue_in.bits.data := 0.U
-      when (io.net_in.valid && io.net_in.ready && reg_msg_len <= LNICConsts.NET_IF_BYTES.U) {
+      when (pktQueue_in.ready && reg_msg_len <= LNICConsts.NET_IF_BYTES.U) {
         state := sIdle
         pktQueue_in.bits.last := true.B
         pktQueue_in.bits.keep := (1.U << reg_msg_len) - 1.U
@@ -362,6 +365,399 @@ class LNICAssemble(implicit p: Parameters) extends Module {
     }
   }
 
+  // state machine to drive io.meta_out and read metaQueue
+  val stateMetaOut = RegInit(sStart)
+
+  switch (stateMetaOut) {
+    is (sStart) {
+        // io.meta_out is valid on the first word
+        io.meta_out.valid := metaQueue_out.valid
+        io.meta_out.bits := metaQueue_out.bits
+        when (io.net_out.valid && io.net_out.ready) {
+          metaQueue_out.ready := io.net_out.bits.last
+          when (!io.net_out.bits.last) {
+            stateMetaOut := sEnd
+          }
+        }
+    }
+    is (sEnd) {
+      when (io.net_out.valid && io.net_out.ready && io.net_out.bits.last) {
+        metaQueue_out.ready := true.B
+        stateMetaOut := sStart
+      }
+    }
+  }
+
 }
 
+
+/**
+ * LNIC Per-Context FIFO queues and interrupt generation.
+ *
+ * Tasks:
+ *   - Receive messages from the reassembly buffer.
+ *   - The messages indicate which context they are for.
+ *   - If the corresponding FIFO is full then drop the message.
+ *   - Otherwise, write the message into the FIFO by reading from the free list and adding to the appropriate linked-list.
+ *   - If the message is for a context that has a higher priority than the current_priority input signal (0 is highest priority)
+ *     then generate an interrupt and update top_context and top_priority output signals
+ *   - Dequeue words from the FIFO indicated by the current_context input signal
+ *     - Remember that last 2 words that were dequeued for this context in case we need to roll back on pipeline flush
+ *   - If the current_context_idle signal is asserted and top_context =/= current_context then generate an interrupt
+ *   - Insert / remove the current context when told to do so
+ */
+class LNICRxQueuesIO(val entries: Int) extends Bundle {
+  val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
+  val meta_in = Flipped(Valid(new PISAMetaOut))
+  val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
+
+  val cur_context = Input(UInt(width = LNICConsts.LNIC_CONTEXT_BITS))
+  val cur_priority = Input(UInt(width = LNICConsts.LNIC_PRIORITY_BITS))
+  val insert = Input(Bool())
+  // val remove = Input(Bool()) // we won't support remove for now since it would involve clearing the FIFO
+  val idle = Input(Bool())
+
+  val top_context = Output(UInt(width = LNICConsts.LNIC_CONTEXT_BITS))
+  val top_priority = Output(UInt(width = LNICConsts.LNIC_PRIORITY_BITS))
+  val interrupt = Output(Bool())
+
+  // number of words for the current context
+  val count = Output(UInt(log2Ceil(entries + 1).W))
+  val unread = Flipped(Valid(UInt(width = 2)))
+
+  override def cloneType = new LNICRxQueuesIO().asInstanceOf[this.type]
+}
+
+class FIFOWord(val ptrBits: Int) extends Bundle {
+  val word = new StreamChannel(LNICConsts.NET_IF_WIDTH)
+  val next = UInt(width = ptrBits)
+
+  override def cloneType = new FIFOWord(ptrBits).asInstanceOf[this.type]
+}
+
+class HeadTableEntry(val ptrBits: Int) extends Bundle {
+  val valid = Bool()
+  val head = UInt(width = ptrBits)
+  val head_minus1 = UInt(width = ptrBits)
+  val head_minus2 = UInt(width = ptrBits)
+
+  override def cloneType = new HeadTableEntry(ptrBits).asInstanceOf[this.type]
+}
+
+class TailTableEntry(val ptrBits: Int) extends Bundle {
+  val valid = Bool()
+  val tail = UInt(width = ptrBits)
+
+  override def cloneType = new TailTableEntry(ptrBits).asInstanceOf[this.type]
+}
+
+@chiselName
+class LNICRxQueues(implicit p: Parameters)(val entries: Int, val num_contexts: Int) extends Module {
+  val io = IO(new LNICRxQueuesIO)
+
+  // divide the buffer space equally amongst contexts
+  // NOTE: this may change in the future, but it's easy for now
+  val max_qsize = entries/num_contexts
+
+  val ptrBits = log2Ceil(entries)
+  // create memory used to store msg words
+  val ram = Mem(entries, FIFOWord(ptrBits))
+  // create free list for msg words
+  val freelist = Module(new FreeList(entries))
+  // create tables for indexing head/tail of FIFOs in the RAM
+  // TODO(sibanez): currently just using context_id to directly index the tables.
+  //   These should eventually turn into propper d-left lookup tables
+  val head_table = Mem(num_contexts, HeadTableEntry(ptrBits))
+  val tail_table = Mem(num_contexts, TailTableEntry(ptrBits))
+
+  // create regs to store count and priority for each context
+  // NOTE: using regs for these right now, but would ideally use a PQ to keep
+  //   track of the highest priority context with data to process
+  val counts = RegInit(VecInit(Seq.fill(num_contexts)(0.U(log2Ceil(max_qsize + 1).W))))
+  val priorities = RegInit(VecInit(Seq.fill(num_contexts)(0.U(LNICConsts.LNIC_PRIORITY_BITS.W))))
+
+  val cur_index = io.cur_context
+  val enq_index = io.meta_in.lnic_dst
+
+  val do_enq = Wire(Bool())
+  val do_deq = Wire(Bool())
+  do_enq := false.B
+  do_deq := false.B
+
+  // defaults
+  // do not enq or deq from the free list
+  freelist.io.enq.valid := false.B
+  freelist.io.enq.bits := 0.U
+  freelist.io.deq.ready := false.B
+  // don't receive incomming messages
+  io.net_in.ready := false.B
+
+  io.count := counts(io.cur_context)
+
+  io.net_out.valid := false.B
+  io.net_out.bits.data := 0.U
+  io.net_out.bits.keep := 0.U
+  io.net_out.bits.last := false.B
+
+  // Logic to insert new contexts.
+  //   when insert is asserted, insert the cur_context into the head/tail_tables
+  //   and insert the cur_priority into the priorities
+  //   and set count to 0
+  when (io.insert) {
+    // do not perform an enqueue because we need to update tail_table
+    io.net_in.ready = false.B
+    // update head_table, try to read from free list
+    freelist.io.deq.ready := true.B
+    val new_head_entry = Wire(new HeadTableEntry(ptrBits))
+    new_head_entry.valid := freelist.io.deq.valid
+    new_head_entry.head := freelist.io.deq.bits
+    new_head_entry.head_minus1 := freelist.io.deq.bits
+    new_head_entry.head_minus2 := freelist.io.deq.bits
+    head_table(cur_index) := new_head_entry
+    // update tail_table
+    val new_tail_entry = Wire(new TailTableEntry(ptrBits))
+    new_tail_entry.valid := freelist.io.deq.valid
+    new_tail_entry.tail := freelist.io.deq.bits
+    tail_table(cur_index) := new_tail_entry
+    // set priority
+    priorities(cur_index) := io.cur_priority
+    // initialize count
+    count(cur_index) := 0.U
+  } .otherwise {
+
+    // State machine to perform enqueue & drop operations
+    // Drop message if:
+    //   (1) the FIFO does not have enough space
+    //   (2) the context ID is unallocated // TODO(sibanez): unimplemented ...
+    val sStart :: sEnqueue :: sDrop :: Nil = Enum(3)
+    val enqState = RegInit(sStart)
+
+    val reg_enq_index = RegInit(0.U(LNICConsts.LNIC_CONTEXT_BITS.W))
+
+    // this module should not assert back pressure (except during context insertion)
+    io.net_in.ready := true.B
+
+    switch(enqState) {
+      is (sStart) {
+        when (io.net_in.valid) {
+          val msg_words = (io.meta_in.msg_len >> 3.U) + 1.U // NOTE: this is assuming 8B words
+          when (msg_words < (max_qsize - counts(enq_index))) {
+            // there is enough room, enqueue the msg
+            perform_enq(enq_index)
+            reg_enq_index := enq_index
+            enqState := sEnqueue
+          } .otherwise {
+            // there is NOT enough room, drop the msg
+            enqState := sDrop
+          }
+        }
+      }
+      is (sEnqueue) {
+        when (io.net_in.valid) {
+          enq_index := reg_enq_index
+          perform_enq(enq_index)
+          when (io.net_in.bits.last) {
+            enqState := sStart
+          }
+        }
+      }
+      is (sDrop) {
+        when (io.net_in.valid && io.net_in.bits.last) {
+          enqState := sStart
+        }
+      }
+    }
+
+    // Logic to perform dequeue & unread operations.
+    // Only add a ptr to the free list once head_minus2 no longer needs it.
+    io.net_out.valid := (counts(cur_index) > 0.U)
+
+    val unread_cnt = Wire(UInt())
+    unread_cnt := 0.U
+
+    // TODO(sibanez): what if there is an unread at the same time as an insert? Is that possible?
+    when (io.unread.valid) {
+      when (io.unread.bits.andR) { // roll back 2 words
+        unread_cnt := 2.U
+        val cur_head_entry = head_table(cur_index)
+        val new_head_entry = cur_head_entry
+        new_head_entry.head := cur_head_entry.head_minus2
+        new_head_entry.head_minus1 := cur_head_entry.head_minus2
+        head_table(cur_index) := new_head_entry
+      } .elsewhen (io.unread.bits.orR) { // roll back 1 word
+        unread_cnt := 1.U
+        val cur_head_entry = head_table(cur_index)
+        val new_head_entry = cur_head_entry
+        new_head_entry.head := cur_head_entry.head_minus1
+        head_table(cur_index) := new_head_entry
+      }
+    } .elsewhen (io.net_out.valid && io.net_out.ready) {
+      // perform dequeue
+      perform_deq(cur_index)
+    }
+
+    // Logic to count the size of each FIFO, updated on enq/deq/unread operations
+    for (i <- 0 until counts.size) {
+      val enq_val = Mux(do_enq && (enq_index === i.U), 1.U, 0.U)
+      val deq_val = Mux(do_deq && (cur_index === i.U), 1.U, 0.U)
+      val unread_val = Mux(io.unread.valid && (cur_index === i.U), unread_cnt, 0.U)
+      counts(i.U) := counts(i.U) + enq_val - deq_val + unread_val
+    }
+
+  }
+
+  // Update top_context and top_priority every time a word is enqueued, dequeued, or there is an unread operation.
+
+  val reg_top_priority = RegInit(0.U(LNICConsts.LNIC_PRIORITY_BITS.W))
+  val reg_top_context = RegInit(0.U(LNICConsts.LNIC_CONTEXT_BITS.W))
+
+  val reg_do_enq = Reg(next = do_enq)
+  val reg_do_deq = Reg(next = do_deq)
+  val reg_do_unread = Reg(next = io.unread.valid)
+
+  // TODO(sibanez): implement this ...
+  when (reg_do_enq || reg_do_deq || reg_do_unread) {
+    // Collect all context IDs (indicies) with count > 0 then select the one with the highest priority
+    val active_contexts = priorities.zipWithIndex.filter(counts(_._2.U) > 0.U)
+    when (active_contexts.size > 0.U) {
+      (reg_top_priority, reg_top_context) := active_contexts.reduce( case (tuple1, tuple2) => {
+        val top_prio = Wire(UInt())
+        val top_context = Wire(UInt())
+        when (tuple1._1 < tuple2._1) {
+          top_prio := tuple1._1
+          top_context := tuple1._2.U
+        } .otherwise {
+          top_prio := tuple2._1
+          top_context := tuple2._2.U
+        }
+        (top_prio, top_context)
+      })
+    } .otherwise {
+      // select current context if there are no active contexts
+      reg_top_priority := io.cur_priority
+      reg_top_context := io.cur_context
+    }
+  }
+
+  io.top_priority := reg_top_priority
+  io.top_context := reg_top_context
+
+  // Generate an interrupt whenever:
+  //   (1) an enqueue operation causes top_context =/= cur_context
+  //   (2) cur_context_idle is asserted and top_context =/= cur_context
+
+  // default - do not fire interrupt
+  io.interrupt := false.B
+
+  val reg_reg_do_enq = Reg(next = reg_do_enq)
+  when (reg_reg_do_enq && (reg_top_context =/= io.cur_context)) {
+    io.interrupt := true.B
+  } .elsewhen (io.idle && (reg_top_context =/= io.cur_context)) {
+    io.interrupt := true.B
+  }
+
+
+  def perform_enq(index: UInt) = {
+    do_enq := true.B
+    // lookup current tail_ptr for this context
+    val cur_tail_entry = Wire(new TailTableEntry(ptrBits))
+    cur_tail_entry := tail_table(index)
+    val tail_ptr = cur_tail_entry.tail
+    assert (cur_tail_entry.valid, "Attempting to perform an enqueue for an invalid contextID")
+
+    // read free list
+    val tail_ptr_next = freelist.io.deq.bits
+    freelist.io.deq.ready := true.B
+    assert (freelist.io.deq.valid, "Free list is empty during msg enqueue!")
+
+    // write new word to RAM
+    val enq_fifo_word = Wire(new FIFOWord(ptrBits))
+    enq_fifo_word.word := io.net_in.bits
+    enq_fifo_word.next := tail_ptr_next
+    ram(tail_ptr) := enq_fifo_word
+
+    // update tail ptr
+    val new_tail_entry = cur_tail_entry
+    new_tail_entry.tail := tail_ptr_next
+    tail_table(index) := new_tail_entry
+  }
+
+  def perform_deq(index: UInt) = {
+    do_deq := true.B
+    // lookup the current head of the FIFO for this context
+    val cur_head_entry = Wire(new HeadTableEntry(ptrBits))
+    cur_head_entry := head_table(index)
+    val head_ptr = cur_head_entry.head
+    assert (cur_head_entry.valid, "Attempting to perform dequeue for an invalid contextID")
+
+    // read the head word from the RAM
+    val deq_fifo_word = Wire(new FIFOWord(ptrBits))
+    deq_fifo_word := ram(head_ptr)
+    io.net_out.bits := deq_fifo_word.word
+    val head_ptr_next = deq_fifo_word.next
+
+    // update head table
+    val new_head_entry = cur_head_entry
+    new_head_entry.head := head_ptr_next
+    when (cur_head_entry.head_minus1 =/= head_ptr) {
+      new_head_entry.head_minus1 := head_ptr
+      when (cur_head_entry.head_minus2 =/= cur_head_entry.head_minus1) {
+        new_head_entry.head_minus2 := cur_head_entry.head_minus1
+        // add head_minus2 to the free list
+        freelist.io.enq.valid := true.B
+        freelist.io.enq.bits := cur_head_entry.head_minus2
+        assert (freelist.io.enq.ready, "Free list is full during dequeue!")
+      }
+    }
+    head_table(index) := new_head_entry
+  }
+
+}
+
+class FreeList(val entries: Int) extends Module {
+  val io = IO(new Bundle {
+    // enq ptrs into this module
+    val enq = Flipped(Decoupled(UInt(width = log2Ceil(entries))))
+    // deq ptrs from this module
+    val deq = Decoupled(UInt(width = log2Ceil(entries)))
+  })
+
+  val ptrBits = log2Ceil(entries)
+
+  // create FIFO queue to store pointers
+  val queue_in = Wire(Decoupled(UInt(width = ptrBits)))
+  val queue_out = Queue(queue_in, entries)
+
+  val sReset :: sIdle :: Nil = Enum(2)
+  val state = RegInit(sReset)
+
+  val reg_ptr = RegInit(0.U(ptrBits.W))
+
+  // default - connect queue to enq/deq interfaces
+  queue_in <> io.enq
+  io.deq <> queue_out
+
+  switch(state) {
+    is (sReset) {
+      // disconnect queue from enq/deq interfaces
+      io.enq.ready := false.B
+      io.deq.valid := false
+      queue_out.ready := false.B
+      // insert 0 - (entries-1) into the queue on reset
+      queue_in.valid := true.B
+      queue_in.bits := reg_ptr
+      when (queue_in.ready) {
+        reg_ptr := reg_ptr + 1.U
+      }
+      when (reg_ptr === (entries - 1).U) {
+        state := sIdle
+      }
+    }
+    is (sIdle) {
+      queue_in <> io.enq
+      io.deq <> queue_out
+    }
+  }
+
+}
 
