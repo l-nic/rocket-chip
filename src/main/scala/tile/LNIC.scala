@@ -58,7 +58,8 @@ object NetworkHelpers {
 case class LNICParams(
   usingLNIC: Boolean = false,
   usingGPRs: Boolean = false,
-  rxQueueFlits: Int = 16,
+  maxNumContexts: Int = 2,
+  rxBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
   txQueueFlits: Int = 16,
   pktizePktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
   arbiterPktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
@@ -99,10 +100,18 @@ class StreamIO(w: Int) extends Bundle {
   override def cloneType = new StreamIO(w).asInstanceOf[this.type]
 }
 
+class CoreNetMeta extends Bundle {
+  val context_id = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
+
+  override def cloneType = new CoreNetMeta().asInstanceOf[this.type]
+}
+
 /**
  * This is intended to be the IO to the core.
  */
 class LNICCoreIO extends StreamIO(LNICConsts.NET_IF_WIDTH) {
+  val meta_in = Flipped(Valid(new CoreNetMeta))
+  val meta_out = Valid(new CoreNetMeta)
   override def cloneType = (new LNICCoreIO).asInstanceOf[this.type]
 }
 
@@ -146,6 +155,7 @@ class LNICModuleImp(outer: LNIC)(implicit p: Parameters) extends LazyModuleImp(o
   val assemble = Module(new LNICAssemble)
 
   pktize.io.net_in <> io.core.in
+  pktize.io.meta_in <> io.core.meta_in
   arbiter.io.core_in <> pktize.io.net_out
   arbiter.io.core_meta_in <> pktize.io.meta_out
   arbiter.io.net_in <> io.net.in
@@ -157,6 +167,7 @@ class LNICModuleImp(outer: LNIC)(implicit p: Parameters) extends LazyModuleImp(o
   assemble.io.net_in <> split.io.core_out
   assemble.io.meta_in <> split.io.core_meta_out
   io.core.out <> assemble.io.net_out
+  io.core.meta_out <> assemble.io.meta_out
 }
 
 /** An I/O Bundle for LNIC RxQueue.
@@ -300,7 +311,9 @@ trait CanHaveLNICModule { this: RocketTileModuleImp =>
     net.get <> outer.lnic.get.module.io.net
     // Connect LNIC module to RocketCore
     core.io.net.get.in <> outer.lnic.get.module.io.core.out
+    core.io.net.get.meta_in <> outer.lnic.get.module.io.core.meta_out
     outer.lnic.get.module.io.core.in <> core.io.net.get.out
+    outer.lnic.get.module.io.core.meta_in <> core.io.net.get.meta_out
   }
 }
 

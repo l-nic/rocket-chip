@@ -279,7 +279,9 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
     // Connect CSRFile network IO to RocketCore IO
     csr.io.net.get.in <> io.net.get.in
+    csr.io.net.get.meta_in <> io.net.get.meta_in
     io.net.get.out <> csr.io.net.get.out
+    io.net.get.meta_out <> csr.io.net.get.meta_out
   }
 
   // TODO(sibanez): how to drive reg file read enable for L-NIC?

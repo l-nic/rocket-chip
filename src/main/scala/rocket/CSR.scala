@@ -353,15 +353,26 @@ class CSRFile(
   val reg_lmsgsrdy = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
   val txQueue_in = if (usingLNIC) Some(Wire(Decoupled(new StreamChannel(xLen)))) else None
   val rxQueue_out = if (usingLNIC) Some(Wire(Flipped(Decoupled(new StreamChannel(xLen))))) else None
+  val reg_lcurcontext = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
   // rxQueue must be able to support unread operations for pipeline flushes if using GPRs
-  val rxQueue = Module(new LNICRxQueue(new StreamChannel(xLen), p(LNICKey).rxQueueFlits))
+  val rxQueues = Module(new LNICRxQueues(p(LNICKey).rxBufFlits, p(LNICKey).maxNumContexts))
+  // signal to tell rxQueues to register the current context
+  val insert_context = Wire(Bool())
+  insert_context := false.B // default
 
   if (usingLNIC) {
     // Connect rxQueue input / output
-    rxQueue.io.enq <> io.net.get.in
-    rxQueue_out.get <> rxQueue.io.deq
+    rxQueues.io.net_in <> io.net.get.in
+    rxQueues.io.meta_in <> io.net.get.meta_in
+    rxQueue_out.get <> rxQueues.io.net_out
+    rxQueues.io.cur_context := reg_lcurcontext.get
+    rxQueues.io.insert := insert_context
     // Connect txQueue output to network io output
     io.net.get.out := Queue(txQueue_in.get, p(LNICKey).txQueueFlits)
+    // TODO(sibanez): meta_out below is not really driven correctly, we should really record the context ID
+    //   that wrote each word and pass that along, but this hack should usually work.
+    io.net.get.meta_out.valid := false.B // default
+    io.net.get.meta_out.bits.context_id := reg_lcurcontext.get
     if (lnicUsingGPRs) {
       /* Wire up txQueue_in */
       io.tx.get.cmd.ready := txQueue_in.get.ready
@@ -376,7 +387,7 @@ class CSRFile(
       io.rx.get.cmd.bits := rxQueue_out.get.bits.data
 
       /* Wire up rxQueue unread cmd */
-      rxQueue.io.unread <> io.rx_undo.get
+      rxQueues.io.unread <> io.rx_undo.get
     } else { // using CSRs
       /* Set txQueue_in defaults */
       txQueue_in.get.valid := false.B
@@ -388,8 +399,8 @@ class CSRFile(
       rxQueue_out.get.ready := false.B
 
       /* Wire up rxQueue unread cmd */
-      rxQueue.io.unread.valid := false.B
-      rxQueue.io.unread.bits := 0.U
+      rxQueues.io.unread.valid := false.B
+      rxQueues.io.unread.bits := 0.U
     }
   }
 
@@ -532,6 +543,8 @@ class CSRFile(
 
   if (usingLNIC) {
     read_mapping += CSRs.lmsgsrdy -> reg_lmsgsrdy.get
+    read_mapping += CSRs.lcurcontext -> reg_lcurcontext.get
+    read_mapping += CSRs.lniccmd -> 0.U
     if (lnicUsingCSRs) {
       read_mapping += CSRs.lread -> rxQueue_out.get.bits.data
       read_mapping += CSRs.lwrite -> 0.U
@@ -772,6 +785,15 @@ class CSRFile(
      *   - This module (CSRFile) enforces the length on all TX messages 
      */
 
+    when (csr_wen) {
+      when (decoded_addr(CSRs.lcurcontext)) {
+        reg_lcurcontext.get := wdata
+      }
+      when (decoded_addr(CSRs.lniccmd)) {
+        insert_context := wdata(0).asBool
+      }
+    }
+
     if (lnicUsingCSRs) {
       // wire up txQueue_in
       when (csr_wen && decoded_addr(CSRs.lwrite)) {
@@ -821,7 +843,7 @@ class CSRFile(
     /**********************************/
     // TODO(sibanez): for now, we just need lmsgsrdy to be >0 when there are words available and 0 otherwise.
     // Eventually, it may be nice to use lmsgsrdy to indicate the actual number of msgs available.
-    reg_lmsgsrdy.get := (rxQueue.io.count > 0).asUInt
+    reg_lmsgsrdy.get := (rxQueues.io.count > 0).asUInt
   }
 
   io.csrw_counter := Mux(coreParams.haveBasicCounters && csr_wen && (io.rw.addr.inRange(CSRs.mcycle, CSRs.mcycle + CSR.nCtr) || io.rw.addr.inRange(CSRs.mcycleh, CSRs.mcycleh + CSR.nCtr)), UIntToOH(io.rw.addr(log2Ceil(CSR.nCtr+nPerfCounters)-1, 0)), 0.U)
