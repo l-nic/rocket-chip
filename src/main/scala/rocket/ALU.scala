@@ -92,17 +92,16 @@ class ALU(implicit p: Parameters) extends CoreModule()(p) {
   val logic = Mux(io.fn === FN_XOR || io.fn === FN_OR, in1_xor_in2, UInt(0)) |
               Mux(io.fn === FN_OR || io.fn === FN_AND, io.in1 & io.in2, UInt(0))
   val shift_logic = (isCmp(io.fn) && slt) | logic | shout
-  val out = Mux(io.fn === FN_ADD || io.fn === FN_SUB, io.adder_out, shift_logic)
 
   // REVS, REVI, REVL
-  val final_out = Mux(io.fn === FN_REVS, Cat(io.in1(63, 16), NetworkHelpers.reverse_bytes(io.in1(15, 0), 2)),
+  val rev_logic = Mux(io.fn === FN_REVS, Cat(io.in1(63, 16), NetworkHelpers.reverse_bytes(io.in1(15, 0), 2)),
                     Mux(io.fn === FN_REVI, Cat(io.in1(63, 32), NetworkHelpers.reverse_bytes(io.in1(31, 0), 4)),
-                      Mux(io.fn === FN_REVL, NetworkHelpers.reverse_bytes(io.in1, 8), out)))
-//  val final_out = Mux((io.fn === FN_REVS) && (io.dw === DW_64), Cat(io.in1(63, 16), NetworkHelpers.reverse_bytes(io.in1(15, 0), 2)),
-//                    Mux((io.fn === FN_REVI) && (io.dw === DW_64), Cat(io.in1(63, 32), NetworkHelpers.reverse_bytes(io.in1(31, 0), 4)),
-//                      Mux((io.fn === FN_REVL) && (io.dw === DW_64), NetworkHelpers.reverse_bytes(io.in1, 8), out)))
+                      Mux(io.fn === FN_REVL, NetworkHelpers.reverse_bytes(io.in1, 8), io.in1)))
+  
+  val out = Mux(io.fn(4).asBool, rev_logic,
+              Mux(io.fn === FN_ADD || io.fn === FN_SUB, io.adder_out, shift_logic))
 
-  io.out := final_out
+  io.out := out
   if (xLen > 32) {
     require(xLen == 64)
     when (io.dw === DW_32) { io.out := Cat(Fill(32, out(31)), out(31,0)) }
