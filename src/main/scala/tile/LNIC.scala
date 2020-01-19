@@ -60,7 +60,6 @@ case class LNICParams(
   usingGPRs: Boolean = false,
   maxNumContexts: Int = 2,
   rxBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
-  txQueueFlits: Int = 16,
   pktizePktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
   arbiterPktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
   arbiterMetaBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
@@ -100,19 +99,30 @@ class StreamIO(w: Int) extends Bundle {
   override def cloneType = new StreamIO(w).asInstanceOf[this.type]
 }
 
-class CoreNetMeta extends Bundle {
-  val context_id = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
+class NetToCoreMeta extends AssembleMetaOut {
+  override def cloneType = new NetToCoreMeta().asInstanceOf[this.type]
+}
 
-  override def cloneType = new CoreNetMeta().asInstanceOf[this.type]
+class CoreToNetMeta extends PktizeMetaOut {
+  override def cloneType = new CoreToNetMeta().asInstanceOf[this.type]
 }
 
 /**
- * This is intended to be the IO to the core.
+ * This is intended to be L-NIC's IO to the core.
  */
 class LNICCoreIO extends StreamIO(LNICConsts.NET_IF_WIDTH) {
-  val meta_in = Flipped(Valid(new CoreNetMeta))
-  val meta_out = Valid(new CoreNetMeta)
+  val meta_in = Flipped(Valid(new CoreToNetMeta))
+  val meta_out = Valid(new NetToCoreMeta)
   override def cloneType = (new LNICCoreIO).asInstanceOf[this.type]
+}
+
+/**
+ * This is intended to be the Core's IO to L-NIC.
+ */
+class CoreLNICIO extends StreamIO(LNICConsts.NET_IF_WIDTH) {
+  val meta_in = Flipped(Valid(new NetToCoreMeta))
+  val meta_out = Valid(new CoreToNetMeta)
+  override def cloneType = (new CoreLNICIO).asInstanceOf[this.type]
 }
 
 /**
@@ -143,21 +153,14 @@ class LNIC(implicit p: Parameters) extends LazyModule {
 class LNICModuleImp(outer: LNIC)(implicit p: Parameters) extends LazyModuleImp(outer) {
   val io = IO(new LNICIO)
 
-//  // Connect io.core to io.net with FIFOs for now
-//  io.core.out <> Queue(io.net.in, p(LNICKey).inBufFlits)
-//  io.net.out <> Queue(io.core.in, p(LNICKey).outBufFlits)
-
   // NIC datapath
-  val pktize = Module(new LNICPktize)
   val arbiter = Module(new LNICArbiter)
   val pisa = Module(new LNICPISA)
   val split = Module(new LNICSplit)
   val assemble = Module(new LNICAssemble)
 
-  pktize.io.net_in <> io.core.in
-  pktize.io.meta_in <> io.core.meta_in
-  arbiter.io.core_in <> pktize.io.net_out
-  arbiter.io.core_meta_in <> pktize.io.meta_out
+  arbiter.io.core_in <> io.core.in
+  arbiter.io.core_meta_in <> io.core.meta_in
   arbiter.io.net_in <> io.net.in
   pisa.io.net_in <> arbiter.io.net_out
   pisa.io.meta_in <> arbiter.io.meta_out

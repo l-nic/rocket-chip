@@ -228,7 +228,7 @@ class CSRFileIO(implicit p: Parameters) extends CoreBundle
   val csrw_counter = UInt(OUTPUT, CSR.nCtr)
   val inst = Vec(retireWidth, UInt(width = iLen)).asInput
   val trace = Vec(retireWidth, new TracedInstruction).asOutput
-  val net = if (usingLNIC) Some(new LNICCoreIO()) else None
+  val net = if (usingLNIC) Some(new CoreLNICIO()) else None
   // RegFile tells CSRFile when to enq data into txQueue
   val tx = if (usingLNIC && lnicUsingGPRs) Some(new CSRTxCmd) else None
   // RegFile tells CSRFile when to deq data from rxQueue
@@ -351,49 +351,46 @@ class CSRFile(
 
   // Define LNIC CSRs, Rx/Tx queues, and additional wires
   val reg_lmsgsrdy = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
-  val txQueue_in = if (usingLNIC) Some(Wire(Decoupled(new StreamChannel(xLen)))) else None
-  val rxQueue_out = if (usingLNIC) Some(Wire(Flipped(Decoupled(new StreamChannel(xLen))))) else None
   val reg_lcurcontext = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
   // rxQueue must be able to support unread operations for pipeline flushes if using GPRs
-  val rxQueues = Module(new LNICRxQueues(p(LNICKey).rxBufFlits, p(LNICKey).maxNumContexts))
+  val rxQueues = Module(new LNICRxQueues)
+  val rxQueue_out = if (usingLNIC) Some(Wire(Flipped(Decoupled(UInt(width = xLen))))) else None
+  val txQueues = Module(new LNICPktize)
+  val txQueue_in = if (usingLNIC) Some(Wire(Decoupled(UInt(width = xLen)))) else None
   // signal to tell rxQueues to register the current context
   val insert_context = Wire(Bool())
   insert_context := false.B // default
 
   if (usingLNIC) {
-    // Connect rxQueue input / output
+    // Connect rxQueues IO
     rxQueues.io.net_in <> io.net.get.in
     rxQueues.io.meta_in <> io.net.get.meta_in
     rxQueue_out.get <> rxQueues.io.net_out
     rxQueues.io.cur_context := reg_lcurcontext.get
     rxQueues.io.insert := insert_context
-    // Connect txQueue output to network io output
-    io.net.get.out := Queue(txQueue_in.get, p(LNICKey).txQueueFlits)
-    // TODO(sibanez): meta_out below is not really driven correctly, we should really record the context ID
-    //   that wrote each word and pass that along, but this hack should usually work.
-    io.net.get.meta_out.valid := false.B // default
-    io.net.get.meta_out.bits.context_id := reg_lcurcontext.get
+    // Connect txQueues IO
+    txQueues.io.net_in <> txQueue_in.get
+    io.net.get.out <> txQueues.io.net_out
+    io.net.get.meta_out <> txQueues.io.meta_out
+    txQueues.io.cur_context := reg_lcurcontext.get
+    txQueues.io.insert := insert_context
     if (lnicUsingGPRs) {
       /* Wire up txQueue_in */
       io.tx.get.cmd.ready := txQueue_in.get.ready
       txQueue_in.get.valid := io.tx.get.cmd.valid
-      txQueue_in.get.bits.data := io.tx.get.cmd.bits
-      txQueue_in.get.bits.keep := LNICConsts.NET_FULL_KEEP // default
-      txQueue_in.get.bits.last := false.B // default
+      txQueue_in.get.bits := io.tx.get.cmd.bits
   
       /* Wire up rxQueue_out */
       rxQueue_out.get.ready := io.rx.get.cmd.ready
       io.rx.get.cmd.valid := rxQueue_out.get.valid
-      io.rx.get.cmd.bits := rxQueue_out.get.bits.data
+      io.rx.get.cmd.bits := rxQueue_out.get.bits
 
       /* Wire up rxQueue unread cmd */
       rxQueues.io.unread <> io.rx_undo.get
     } else { // using CSRs
       /* Set txQueue_in defaults */
       txQueue_in.get.valid := false.B
-      txQueue_in.get.bits.data := 0.U
-      txQueue_in.get.bits.keep := LNICConsts.NET_FULL_KEEP
-      txQueue_in.get.bits.last := false.B
+      txQueue_in.get.bits := 0.U
 
       /* Set rxQueue_out defaults */
       rxQueue_out.get.ready := false.B
@@ -546,7 +543,7 @@ class CSRFile(
     read_mapping += CSRs.lcurcontext -> reg_lcurcontext.get
     read_mapping += CSRs.lniccmd -> 0.U
     if (lnicUsingCSRs) {
-      read_mapping += CSRs.lread -> rxQueue_out.get.bits.data
+      read_mapping += CSRs.lread -> rxQueue_out.get.bits
       read_mapping += CSRs.lwrite -> 0.U
     }
   }
@@ -798,7 +795,7 @@ class CSRFile(
       // wire up txQueue_in
       when (csr_wen && decoded_addr(CSRs.lwrite)) {
         txQueue_in.get.valid := true.B
-        txQueue_in.get.bits.data := wdata
+        txQueue_in.get.bits := wdata
         // NOTE: txQueue_in.get.bits.last/keep are driven below
         // TODO(sibanez): what to do when txQueue is full (i.e. !txQueue_in.ready)
         // That will only happen if the NIC is unable to keep up with the CPU
@@ -809,34 +806,37 @@ class CSRFile(
       rxQueue_out.get.ready := csr_ren && decoded_addr(CSRs.lread)
     }
 
-    /****************************************/
-    /* LNIC txQueue_in.bits.last/keep logic */
-    /****************************************/
-    val txMsgLen = RegInit(0.U(16.W))
-    val sTxWaitFirstWord :: sTxWaitLastWord :: Nil = Enum(2)
-    val txMsgState = RegInit(sTxWaitFirstWord)
-
-    switch (txMsgState) {
-      is (sTxWaitFirstWord) {
-        when (txQueue_in.get.valid && txQueue_in.get.ready) {
-          // record msg length
-          txMsgLen := txQueue_in.get.bits.data(15, 0)
-          txMsgState := sTxWaitLastWord
-        }
-      }
-      is (sTxWaitLastWord) {
-        when (txQueue_in.get.valid && txQueue_in.get.ready) {
-          when (txMsgLen > LNICConsts.NET_IF_BYTES.U) {
-            txMsgLen := txMsgLen - LNICConsts.NET_IF_BYTES.U
-          }.otherwise {
-            txQueue_in.get.bits.last := true.B
-            txQueue_in.get.bits.keep := (1.U << txMsgLen) - 1.U
-            txMsgLen := 0.U
-            txMsgState := sTxWaitFirstWord
-          }
-        }
-      }
-    }
+// TODO(sibanez): move this state machine into the pktization buffer and have one per context
+//    /****************************************/
+//    /* LNIC txQueue_in.bits.last/keep logic */
+//    /****************************************/
+//    val txMsgLen = RegInit(0.U(16.W))
+//    val sTxWaitFirstWord :: sTxWaitLastWord :: Nil = Enum(2)
+//    val txMsgState = RegInit(sTxWaitFirstWord)
+//
+//    switch (txMsgState) {
+//      is (sTxWaitFirstWord) {
+//        when (txQueue_in.get.valid && txQueue_in.get.ready) {
+//          // record msg length
+//          txMsgLen := txQueue_in.get.bits.data(15, 0)
+//          // write txQueue_meta_in
+//          txQueue_meta_in.get.valid := true.B
+//          txMsgState := sTxWaitLastWord
+//        }
+//      }
+//      is (sTxWaitLastWord) {
+//        when (txQueue_in.get.valid && txQueue_in.get.ready) {
+//          when (txMsgLen > LNICConsts.NET_IF_BYTES.U) {
+//            txMsgLen := txMsgLen - LNICConsts.NET_IF_BYTES.U
+//          }.otherwise {
+//            txQueue_in.get.bits.last := true.B
+//            txQueue_in.get.bits.keep := (1.U << txMsgLen) - 1.U
+//            txMsgLen := 0.U
+//            txMsgState := sTxWaitFirstWord
+//          }
+//        }
+//      }
+//    }
 
     /**********************************/
     /* LNIC lmsgsrdy CSR update logic */

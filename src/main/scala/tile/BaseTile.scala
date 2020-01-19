@@ -116,8 +116,7 @@ trait HasNonDiplomaticTileParameters {
 
     // TODO(sibanez): add LNIC params to tileProperties
     val lnic = if (usingLNIC) Map(
-      "lnic-rx-buf-flits"     -> p(LNICKey).rxBufFlits.asProperty,
-      "lnic-tx-queue-flits"     -> p(LNICKey).txQueueFlits.asProperty
+      "lnic-rx-buf-flits"     -> p(LNICKey).rxBufFlits.asProperty
     ) else Nil
 
     dcache ++ icache ++ dtlb ++ itlb ++ mmu ++ pmp ++ incoherent ++ lnic

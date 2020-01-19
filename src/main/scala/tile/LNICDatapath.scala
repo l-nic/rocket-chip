@@ -20,63 +20,314 @@ import NetworkHelpers._
  *   - Reverse byte order of words coming from CPU
  *   - Consume messages from the CPU and transform into pkts
  *   - For now, assume all msgs consist of one pkt
+ *   - Maintain per-context FIFOs
+ *   - Insert / remove contexts when told to do so
+ *   - Store msg until either:
+ *     (1) the whole thing arrives
+ *     (2) an MTU arrives, then send that MTU -- TODO(sibanez): unimplemented
  */
 class PktizeMetaOut extends Bundle {
   val msg_id = UInt(16.W)
   val offset = UInt(16.W) // pkt offset within msg
-  val lnic_src = UInt(16.W) // src context ID
+  val lnic_src = UInt(LNICConsts.LNIC_CONTEXT_BITS.W) // src context ID
 
   override def cloneType = new PktizeMetaOut().asInstanceOf[this.type]
 }
 
 class PktizeIO extends Bundle {
-  val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
-  val meta_in = Flipped(Valid (new CoreNetMeta))
+  val net_in = Flipped(Decoupled(UInt(width = 64))) // words written from the CPU
   val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
   val meta_out = Valid(new PktizeMetaOut)
+
+  val cur_context = Input(UInt(width = LNICConsts.LNIC_CONTEXT_BITS))
+  val insert = Input(Bool())
+  //val remove = Input(Bool()) // TODO(sibanez): we won't support remove for now
 
   override def cloneType = new PktizeIO().asInstanceOf[this.type]
 }
 
+class FIFOWord(val ptrBits: Int) extends Bundle {
+  val word = UInt(width = LNICConsts.NET_IF_WIDTH)
+  val next = UInt(width = ptrBits)
+
+  override def cloneType = new FIFOWord(ptrBits).asInstanceOf[this.type]
+}
+
+class HeadTableEntry(val ptrBits: Int) extends Bundle {
+  val valid = Bool()
+  val head = UInt(width = ptrBits)
+
+  override def cloneType = new HeadTableEntry(ptrBits).asInstanceOf[this.type]
+}
+
+class TailTableEntry(val ptrBits: Int) extends Bundle {
+  val valid = Bool()
+  val tail = UInt(width = ptrBits)
+
+  override def cloneType = new TailTableEntry(ptrBits).asInstanceOf[this.type]
+}
+
+class DequeueReq extends Bundle {
+  val context_id = UInt(LNICConsts.LNIC_CONTEXT_BITS.W) // the context to dequeue from
+  val msg_len = UInt(16.W)
+
+  override def cloneType = new DequeueReq().asInstanceOf[this.type]
+}
+
 @chiselName
 class LNICPktize(implicit p: Parameters) extends Module {
+  val entries = p(LNICKey).pktizePktBufFlits
+  val num_contexts = p(LNICKey).maxNumContexts
+
   val io = IO(new PktizeIO)
 
-  val pktQueue_in = Wire(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
-  pktQueue_in <> io.net_in
-  // reverse byte order of words coming from CPU
-  pktQueue_in.bits.data := reverse_bytes(io.net_in.bits.data, LNICConsts.NET_IF_BYTES)
+  val ptrBits = log2Ceil(entries)
+  // create memory used to store msg words
+  val ram = Mem(entries, new FIFOWord(ptrBits))
+  // create free list for msg words
+  val freelist = Module(new FreeList(entries))
+  // create tables for indexing head/tail of FIFOs in the RAM
+  // TODO(sibanez): currently just using context_id to directly index the tables.
+  //   These should eventually turn into propper d-left lookup tables
+  val head_table = Mem(num_contexts, new HeadTableEntry(ptrBits))
+  val tail_table = Mem(num_contexts, new TailTableEntry(ptrBits))
 
-  io.net_out <> Queue(pktQueue_in, p(LNICKey).pktizePktBufFlits)
+  val cur_head_entry = Wire(new HeadTableEntry(ptrBits))
+  val new_head_entry = Wire(new HeadTableEntry(ptrBits))
+  val cur_tail_entry = Wire(new TailTableEntry(ptrBits))
+  val new_tail_entry = Wire(new TailTableEntry(ptrBits))
 
-  // state machine to drive io.meta_out
-  val sWordOne :: sWaitEnd :: Nil = Enum(2)
-  val state = RegInit(sWordOne)
+  // queue to store dequeue requests sent from the enqueue side to the dequeue side
+  val deqReq_in = Wire(Decoupled(new DequeueReq))
+  val deqReq_out = Wire(Flipped(Decoupled(new DequeueReq)))
+  deqReq_out <> Queue(deqReq_in, num_contexts*8) // TODO(sibanez): what is the best way to size this queue?
 
-  val reg_msg_id = RegInit(0.U(16.W))
+  // default deqReq_in / deqReq_out - do not enq or deq
+  deqReq_in.valid := false.B
+  deqReq_in.bits.context_id := 0.U
+  deqReq_in.bits.msg_len := 0.U
+  deqReq_out.ready := false.B
 
-  switch (state) {
-    is (sWordOne) {
-      when (io.net_out.valid && io.net_out.ready) {
-        io.meta_out.valid := true.B
-        // TODO(sibanez): these are set assuming single pkt messages
-        io.meta_out.bits.msg_id := reg_msg_id
-        io.meta_out.bits.offset := 0.U
-        // TODO(sibanez): this should really be queued up and sent out, but thi hack should usually work
-        io.meta_out.bits.lnic_src := io.meta_in.bits.context_id
-        when (!io.net_out.bits.last) {
-          state := sWaitEnd
+
+  // create regs to store count for each context
+  val counts = RegInit(VecInit(Seq.fill(num_contexts)(0.U(log2Ceil(entries + 1).W))))
+
+  // create regs to store the number of remaining bytes to be enqueued for the current msg of each context
+  val msg_lens = RegInit(VecInit(Seq.fill(num_contexts)(0.U(16.W))))
+  val enq_rem_bytes = RegInit(VecInit(Seq.fill(num_contexts)(0.U(16.W))))
+
+  // generate msg_ids using simple counter
+  val reg_msg_count = RegInit(0.U(16.W))
+
+  val cur_index = io.cur_context
+  val deq_index = Wire(UInt())
+  deq_index := 0.U  // default
+
+  val do_enq = Wire(Bool())
+  val do_deq = Wire(Bool())
+  do_enq := false.B
+  do_deq := false.B
+
+  // defaults
+  // do not enq or deq from the free list
+  freelist.io.enq.valid := false.B
+  freelist.io.enq.bits := 0.U
+  freelist.io.deq.ready := false.B
+
+  // don't receive incomming words from the CPU
+  io.net_in.ready := false.B
+
+  io.net_out.valid := false.B
+  io.net_out.bits.data := 0.U
+  io.net_out.bits.keep := LNICConsts.NET_FULL_KEEP
+  io.net_out.bits.last := false.B
+
+  io.meta_out.valid := false.B
+  io.meta_out.bits.msg_id := reg_msg_count
+  io.meta_out.bits.offset := 0.U // TODO(sibanez): assuming single pkt msgs for now
+  io.meta_out.bits.lnic_src := 0.U // default
+
+
+  // Logic to insert new contexts.
+  //   when insert is asserted, insert the cur_context into the head/tail_tables
+  //   and set count to 0
+  when (io.insert) {
+    // do not perform an enqueue because we need to update tail_table
+    io.net_in.ready := false.B
+    // update head_table, try to read from free list
+    freelist.io.deq.ready := true.B
+    assert (freelist.io.deq.valid, "LNICPktize: freelist is empty during context insertion!")
+    new_head_entry.valid := freelist.io.deq.valid
+    new_head_entry.head := freelist.io.deq.bits
+    head_table(cur_index) := new_head_entry
+    // update tail_table
+    new_tail_entry.valid := freelist.io.deq.valid
+    new_tail_entry.tail := freelist.io.deq.bits
+    tail_table(cur_index) := new_tail_entry
+    // initialize count
+    counts(cur_index) := 0.U
+  } .otherwise {
+
+    /**
+     * State machine to enqueue into the FIFOs.
+     * Tasks:
+     *   - Record msg length
+     *   - Count number of words that have been enqueued so far for this msg
+     *   - Trigger dequeue for cur_context when the last word has been enqueued
+     * TODO(sibanez): for multi-pkt msgs will also need to trigger dequeue when one MTU has been enqueued
+     * TODO(sibanez): should we drop any message here (before enqueue?)
+     */
+    val sStartEnq :: sEnqueue :: Nil = Enum(2)
+    // need one state per context
+    val enqStates = RegInit(VecInit(Seq.fill(num_contexts)(sStartEnq)))
+
+    // this module should not assert back pressure (except during context insertion)
+    // TODO(sibanez): need to figure out what to do when queue is full and incomming words are dropped.
+    //   Probably need to detect this scenario then tell the dequeue logic to drop the msg.
+    //   Do we need to divide the buffer space amongst contexts so that high priority msgs are not
+    //   dropped because of low priority apps using all the buffer space?
+    //   Does this buffer actually fill up? Only if the applications are sending faster than the NIC
+    //   can put pkts onto the wire, which ideally shouldn't be possible.
+    io.net_in.ready := true.B
+
+    switch(enqStates(cur_index)) {
+      is (sStartEnq) {
+        when (io.net_in.valid) {
+          val msg_len = io.net_in.bits(15, 0)
+          msg_lens(cur_index) := msg_len
+          enq_rem_bytes(cur_index) := msg_len
+          perform_enq(cur_index)
+          enqStates(cur_index) := sEnqueue
         }
-        reg_msg_id := reg_msg_id + 1.U
+      }
+      is (sEnqueue) {
+        when (io.net_in.valid) {
+          perform_enq(cur_index)
+          // NOTE: following logic assumes 8B words (64-bit architecture)
+          when (enq_rem_bytes(cur_index) <= 8.U) {
+            // this is the last word of the msg so submit a dequeue request for the current context
+            deqReq_in.valid := true.B
+            deqReq_in.bits.context_id := cur_index
+            deqReq_in.bits.msg_len := msg_lens(cur_index)
+            assert (deqReq_in.ready, "LNICPktize: dequeue request FIFO full during enqueue!")
+            enqStates(cur_index) := sStartEnq
+          } .otherwise {
+            enq_rem_bytes(cur_index) := enq_rem_bytes(cur_index) - 8.U
+          }
+        }
       }
     }
-    is (sWaitEnd) {
-      when (io.net_out.valid && io.net_out.ready && io.net_out.bits.last) {
-        state := sWordOne
+
+    /**
+     * State machine to perform dequeue operations.
+     * Tasks:
+     *   - Wait until there is a dequeue request to process
+     *   - Perform dequeue indicated by the request and set the last bit
+     *   - Swap bytes
+     *   - TODO(sibanez): support drop requests sent from enqueue side
+     */
+    val sStartDeq :: sDequeue :: Nil = Enum(2)
+    val deqState = RegInit(sStartDeq)
+
+    val reg_deq_index = RegInit(0.U(LNICConsts.LNIC_CONTEXT_BITS.W))
+    val deq_rem_bytes = RegInit(0.U(16.W))
+
+    switch (deqState) {
+      is (sStartDeq) {
+        when (deqReq_out.valid) {
+          // there a msg waiting for dequeue, tell the arbiter about it
+          io.net_out.valid := true.B
+          io.meta_out.valid := true.B
+          when (io.net_out.ready) {
+            // the arbiter is ready to receive data
+            deqReq_out.ready := true.B
+            deq_index := deqReq_out.bits.context_id
+            deq_rem_bytes := deqReq_out.bits.msg_len
+            reg_deq_index := deq_index
+            // write metadata
+            io.meta_out.bits.lnic_src := deq_index
+            // dequeue app hdr
+            perform_deq(deq_index)
+            // state transition
+            deqState := sDequeue
+            reg_msg_count := reg_msg_count + 1.U
+            // NOTE: cannot perform dequeue in this state because LNICArbiter (the attached module)
+            //   waits for valid to be set before asserting ready
+          }
+        }
       }
+      is (sDequeue) {
+        io.net_out.valid := true.B
+        when (io.net_out.ready) {
+          deq_index := reg_deq_index
+          perform_deq(deq_index)
+          when (deq_rem_bytes <= 8.U) {
+            // this is the last word of the msg
+            io.net_out.bits.last := true.B
+            io.net_out.bits.keep := (1.U << deq_rem_bytes) - 1.U
+            deqState := sStartDeq
+          } .otherwise {
+            deq_rem_bytes := deq_rem_bytes - 8.U
+          }
+        }
+      }
+    }
+
+    // Logic to count the size of each FIFO, updated on enq/deq operations
+    for (i <- 0 until counts.size) {
+      val enq_inc = Mux(do_enq && (cur_index === i.U), 1.U, 0.U)
+      val deq_dec = Mux(do_deq && (deq_index === i.U), 1.U, 0.U)
+      counts(i.U) := counts(i.U) + enq_inc - deq_dec
     }
   }
 
+  def perform_enq(index: UInt) = {
+    do_enq := true.B
+    // lookup current tail_ptr for this context
+    cur_tail_entry := tail_table(index)
+    val tail_ptr = cur_tail_entry.tail
+    assert (cur_tail_entry.valid, "Attempting to perform an enqueue for an invalid contextID")
+
+    // read free list
+    val tail_ptr_next = freelist.io.deq.bits
+    freelist.io.deq.ready := true.B
+    assert (freelist.io.deq.valid, "Free list is empty during msg enqueue!")
+
+    // write new word to RAM
+    val enq_fifo_word = Wire(new FIFOWord(ptrBits))
+    enq_fifo_word.word := io.net_in.bits
+    enq_fifo_word.next := tail_ptr_next
+    ram(tail_ptr) := enq_fifo_word
+
+    // update tail ptr
+    new_tail_entry := cur_tail_entry // default
+    new_tail_entry.tail := tail_ptr_next
+    tail_table(index) := new_tail_entry
+  }
+
+  def perform_deq(index: UInt) = {
+    do_deq := true.B
+    // lookup the current head of the FIFO for this context
+    cur_head_entry := head_table(index)
+    val head_ptr = cur_head_entry.head
+    assert (cur_head_entry.valid, "Attempting to perform dequeue for an invalid contextID")
+
+    // read the head word from the RAM
+    val deq_fifo_word = Wire(new FIFOWord(ptrBits))
+    deq_fifo_word := ram(head_ptr)
+    // reverse bytes of outing data
+    io.net_out.bits.data := reverse_bytes(deq_fifo_word.word, LNICConsts.NET_IF_BYTES)
+    val head_ptr_next = deq_fifo_word.next
+
+    // update head table
+    new_head_entry := cur_head_entry // default
+    new_head_entry.head := head_ptr_next
+    // add current head to the free list
+    freelist.io.enq.valid := true.B
+    freelist.io.enq.bits := cur_head_entry.head
+    assert (freelist.io.enq.ready, "Free list is full during dequeue!")
+    head_table(index) := new_head_entry
+  }
 }
 
 /**
@@ -285,9 +536,15 @@ class AssembleIO extends Bundle {
   val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
   val meta_in = Flipped(Valid(new PISAMetaOut))
   val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
-  val meta_out = Valid(new CoreNetMeta)
+  val meta_out = Valid(new AssembleMetaOut)
 
   override def cloneType = new AssembleIO().asInstanceOf[this.type]
+}
+
+class AssembleMetaOut extends Bundle {
+  val lnic_dst = UInt(LNICConsts.LNIC_CONTEXT_BITS.W) // dst context ID
+
+  override def cloneType = new AssembleMetaOut().asInstanceOf[this.type]
 }
 
 @chiselName
@@ -380,7 +637,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
     is (sStart) {
         // io.meta_out is valid on the first word
         io.meta_out.valid := metaQueue_out.valid
-        io.meta_out.bits.context_id := metaQueue_out.bits.lnic_dst
+        io.meta_out.bits.lnic_dst := metaQueue_out.bits.lnic_dst
         when (io.net_out.valid && io.net_out.ready) {
           metaQueue_out.ready := io.net_out.bits.last
           when (!io.net_out.bits.last) {
@@ -416,8 +673,8 @@ class LNICAssemble(implicit p: Parameters) extends Module {
  */
 class LNICRxQueuesIO(val entries: Int) extends Bundle {
   val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
-  val meta_in = Flipped(Valid(new CoreNetMeta))
-  val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
+  val meta_in = Flipped(Valid(new NetToCoreMeta))
+  val net_out = Decoupled(UInt(width = 64)) // words to the CPU
 
   val cur_context = Input(UInt(width = LNICConsts.LNIC_CONTEXT_BITS))
   val insert = Input(Bool())
@@ -430,31 +687,21 @@ class LNICRxQueuesIO(val entries: Int) extends Bundle {
   override def cloneType = new LNICRxQueuesIO(entries).asInstanceOf[this.type]
 }
 
-class FIFOWord(val ptrBits: Int) extends Bundle {
-  val word = new StreamChannel(LNICConsts.NET_IF_WIDTH)
-  val next = UInt(width = ptrBits)
-
-  override def cloneType = new FIFOWord(ptrBits).asInstanceOf[this.type]
-}
-
-class HeadTableEntry(val ptrBits: Int) extends Bundle {
-  val valid = Bool()
-  val head = UInt(width = ptrBits)
+/**
+ * Rx Queues must support 2 word roll-back for pipeline flushes.
+ */
+class RxHeadTableEntry(ptrBits: Int) extends HeadTableEntry(ptrBits) {
   val head_minus1 = UInt(width = ptrBits)
   val head_minus2 = UInt(width = ptrBits)
 
-  override def cloneType = new HeadTableEntry(ptrBits).asInstanceOf[this.type]
-}
-
-class TailTableEntry(val ptrBits: Int) extends Bundle {
-  val valid = Bool()
-  val tail = UInt(width = ptrBits)
-
-  override def cloneType = new TailTableEntry(ptrBits).asInstanceOf[this.type]
+  override def cloneType = new RxHeadTableEntry(ptrBits).asInstanceOf[this.type]
 }
 
 @chiselName
-class LNICRxQueues(val entries: Int, val num_contexts: Int)(implicit p: Parameters) extends Module {
+class LNICRxQueues(implicit p: Parameters) extends Module {
+  val entries = p(LNICKey).rxBufFlits
+  val num_contexts = p(LNICKey).maxNumContexts
+
   val io = IO(new LNICRxQueuesIO(entries))
 
   // divide the buffer space equally amongst contexts
@@ -469,11 +716,11 @@ class LNICRxQueues(val entries: Int, val num_contexts: Int)(implicit p: Paramete
   // create tables for indexing head/tail of FIFOs in the RAM
   // TODO(sibanez): currently just using context_id to directly index the tables.
   //   These should eventually turn into propper d-left lookup tables
-  val head_table = Mem(num_contexts, new HeadTableEntry(ptrBits))
+  val head_table = Mem(num_contexts, new RxHeadTableEntry(ptrBits))
   val tail_table = Mem(num_contexts, new TailTableEntry(ptrBits))
 
-  val cur_head_entry = Wire(new HeadTableEntry(ptrBits))
-  val new_head_entry = Wire(new HeadTableEntry(ptrBits))
+  val cur_head_entry = Wire(new RxHeadTableEntry(ptrBits))
+  val new_head_entry = Wire(new RxHeadTableEntry(ptrBits))
   val cur_tail_entry = Wire(new TailTableEntry(ptrBits))
   val new_tail_entry = Wire(new TailTableEntry(ptrBits))
 
@@ -482,7 +729,7 @@ class LNICRxQueues(val entries: Int, val num_contexts: Int)(implicit p: Paramete
 
   val cur_index = io.cur_context
   val enq_index = Wire(UInt())
-  enq_index := io.meta_in.bits.context_id // default
+  enq_index := io.meta_in.bits.lnic_dst // default
 
   val do_enq = Wire(Bool())
   val do_deq = Wire(Bool())
@@ -500,9 +747,7 @@ class LNICRxQueues(val entries: Int, val num_contexts: Int)(implicit p: Paramete
   io.count := counts(io.cur_context)
 
   io.net_out.valid := false.B
-  io.net_out.bits.data := 0.U
-  io.net_out.bits.keep := 0.U
-  io.net_out.bits.last := false.B
+  io.net_out.bits := 0.U
 
   // Logic to insert new contexts.
   //   when insert is asserted, insert the cur_context into the head/tail_tables
@@ -512,6 +757,7 @@ class LNICRxQueues(val entries: Int, val num_contexts: Int)(implicit p: Paramete
     io.net_in.ready := false.B
     // update head_table, try to read from free list
     freelist.io.deq.ready := true.B
+    assert (freelist.io.deq.valid, "LNICRxQueues: freelist is empty during context insertion!")
     new_head_entry.valid := freelist.io.deq.valid
     new_head_entry.head := freelist.io.deq.bits
     new_head_entry.head_minus1 := freelist.io.deq.bits
@@ -620,7 +866,7 @@ class LNICRxQueues(val entries: Int, val num_contexts: Int)(implicit p: Paramete
 
     // write new word to RAM
     val enq_fifo_word = Wire(new FIFOWord(ptrBits))
-    enq_fifo_word.word := io.net_in.bits
+    enq_fifo_word.word := io.net_in.bits.data
     enq_fifo_word.next := tail_ptr_next
     ram(tail_ptr) := enq_fifo_word
 
