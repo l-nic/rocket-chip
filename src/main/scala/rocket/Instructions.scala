@@ -346,7 +346,11 @@ object CSRs {
   val lmsgsrdy = 0x052
   val lcurcontext = 0x053
   val lniccmd = 0x054
+  val lcurpriority = 0x055
+  val lidle = 0x056
   val lwrite = 0x057
+  val ltargetcontext = 0x058
+  val ltargetpriority = 0x059
   
   val cycle = 0xc00
   val time = 0xc01
@@ -562,10 +566,16 @@ object CSRs {
     res += frm
     res += fcsr
 
-    res += lmsgsrdy
     res += lread
+    res += lmsgsrdy
+    res += lcurcontext
+    res += lniccmd
+    res += lcurpriority
+    res += lidle
     res += lwrite
-    
+    res += ltargetcontext
+    res += ltargetpriority
+
     res += cycle
     res += time
     res += instret

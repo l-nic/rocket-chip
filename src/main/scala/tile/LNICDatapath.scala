@@ -677,8 +677,14 @@ class LNICRxQueuesIO(val entries: Int) extends Bundle {
   val net_out = Decoupled(UInt(width = 64)) // words to the CPU
 
   val cur_context = Input(UInt(width = LNICConsts.LNIC_CONTEXT_BITS))
+  val cur_priority = Input(UInt(width = LNICConsts.LNIC_PRIORITY_BITS))
   val insert = Input(Bool())
   // val remove = Input(Bool()) // we won't support remove for now since it would involve clearing the FIFO
+  val idle = Input(Bool())
+
+  val top_context = Output(UInt(width = LNICConsts.LNIC_CONTEXT_BITS))
+  val top_priority = Output(UInt(width = LNICConsts.LNIC_PRIORITY_BITS))
+  val interrupt = Output(Bool())
 
   // number of words for the current context
   val count = Output(UInt(log2Ceil(entries + 1).W))
@@ -726,6 +732,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
 
   // create regs to store count for each context
   val counts = RegInit(VecInit(Seq.fill(num_contexts)(0.U(log2Ceil(max_qsize + 1).W))))
+  val priorities = RegInit(VecInit(Seq.fill(num_contexts)(0.U(LNICConsts.LNIC_PRIORITY_BITS.W))))
 
   val cur_index = io.cur_context
   val enq_index = Wire(UInt())
@@ -767,6 +774,8 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
     new_tail_entry.valid := freelist.io.deq.valid
     new_tail_entry.tail := freelist.io.deq.bits
     tail_table(cur_index) := new_tail_entry
+    // set priority
+    priorities(cur_index) := io.cur_priority
     // initialize count
     counts(cur_index) := 0.U
   } .otherwise {
@@ -850,6 +859,72 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
       val unread_inc = Mux(io.unread.valid && (cur_index === i.U), unread_cnt, 0.U)
       counts(i.U) := counts(i.U) + enq_inc - deq_dec + unread_inc
     }
+  }
+
+  // Update top_context and top_priority every time a word is enqueued, dequeued, or there is an unread operation.
+
+  val reg_top_priority = RegInit(0.U(LNICConsts.LNIC_PRIORITY_BITS.W))
+  val reg_top_context = RegInit(0.U(LNICConsts.LNIC_CONTEXT_BITS.W))
+
+  val reg_do_enq = Reg(next = do_enq)
+  val reg_do_deq = Reg(next = do_deq)
+  val reg_do_unread = Reg(next = io.unread.valid)
+
+  // Update top_priority & top_context on enq/deq/unread operations
+  // Do this on the cycle after enq/deq/unread so that counts is updated
+  when (reg_do_enq || reg_do_deq || reg_do_unread) {
+    // Collect all context IDs (indicies) with count > 0 then select the one with the highest priority
+
+    // TODO(sibanez): implement this ...
+    val context_ids = Wire(Vec(num_contexts, UInt(width = LNICConsts.LNIC_CONTEXT_BITS)))
+    for (i <- 0 until context_ids.size) {
+      context_ids(i) := i.U
+    }
+    val result = priorities.zip(context_ids).reduce( (tuple1, tuple2) => {
+      // tuple._1 = priority, tuple._2 = index (context)
+      val top_prio = Wire(UInt())
+      val top_context = Wire(UInt())
+      when (counts(tuple1._2) > 0.U && counts(tuple2._2) > 0.U) {
+        when (tuple1._1 < tuple2._1) {
+          top_prio := tuple1._1
+          top_context := tuple1._2
+        } .otherwise {
+          top_prio := tuple2._1
+          top_context := tuple2._2
+        }
+      } .elsewhen (counts(tuple1._2) > 0.U) {
+        top_prio := tuple1._1
+        top_context := tuple1._2
+      } .elsewhen (counts(tuple2._2) > 0.U) {
+        top_prio := tuple2._1
+        top_context := tuple2._2
+      } .otherwise {
+        top_prio := io.cur_priority
+        top_context := io.cur_context
+      }
+      (top_prio, top_context)
+    })
+
+    reg_top_priority := result._1
+    reg_top_context := result._2
+  }
+
+  io.top_priority := reg_top_priority
+  io.top_context := reg_top_context
+
+  // Generate an interrupt whenever:
+  //   (1) an enqueue operation causes top_context =/= cur_context
+  //   (2) io.idle is asserted and top_context =/= cur_context
+
+  // default - do not fire interrupt
+  io.interrupt := false.B
+
+  val reg_reg_do_enq = Reg(next = reg_do_enq)
+  val reg_idle = Reg(next = io.idle) // register io.idle to break combinational loop
+  when (reg_reg_do_enq && (reg_top_context =/= io.cur_context)) {
+    io.interrupt := true.B
+  } .elsewhen (reg_idle && (reg_top_context =/= io.cur_context)) {
+    io.interrupt := true.B
   }
 
   def perform_enq(index: UInt) = {

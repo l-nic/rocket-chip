@@ -68,6 +68,7 @@ class DCSR extends Bundle {
 class MIP(implicit p: Parameters) extends CoreBundle()(p)
     with HasCoreParameters {
   val lip = Vec(coreParams.nLocalInterrupts, Bool())
+  val lnip = Bool() // L-NIC interrupt pending
   val zero2 = Bool()
   val debug = Bool() // keep in sync with CSR.debugIntCause
   val zero1 = Bool()
@@ -278,6 +279,7 @@ class CSRFile(
     sup.zero1 := false
     sup.debug := false
     sup.zero2 := false
+    sup.lnip := true
     sup.lip foreach { _ := true }
     val supported_high_interrupts = if (io.interrupts.buserror.nonEmpty) UInt(BigInt(1) << CSR.busErrorIntCause) else 0.U
 
@@ -352,6 +354,9 @@ class CSRFile(
   // Define LNIC CSRs, Rx/Tx queues, and additional wires
   val reg_lmsgsrdy = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
   val reg_lcurcontext = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
+  val reg_lcurpriority = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
+  val reg_ltargetcontext = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
+  val reg_ltargetpriority = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
   // rxQueue must be able to support unread operations for pipeline flushes if using GPRs
   val rxQueues = Module(new LNICRxQueues)
   val rxQueue_out = if (usingLNIC) Some(Wire(Flipped(Decoupled(UInt(width = xLen))))) else None
@@ -360,6 +365,8 @@ class CSRFile(
   // signal to tell rxQueues to register the current context
   val insert_context = Wire(Bool())
   insert_context := false.B // default
+  val app_idle = Wire(Bool())
+  app_idle := false.B
 
   if (usingLNIC) {
     // Connect rxQueues IO
@@ -367,7 +374,12 @@ class CSRFile(
     rxQueues.io.meta_in <> io.net.get.meta_in
     rxQueue_out.get <> rxQueues.io.net_out
     rxQueues.io.cur_context := reg_lcurcontext.get
+    rxQueues.io.cur_priority := reg_lcurpriority.get
     rxQueues.io.insert := insert_context
+    rxQueues.io.idle := app_idle
+    // update target context / priority CSRs
+    reg_ltargetcontext.get := rxQueues.io.top_context
+    reg_ltargetpriority.get := rxQueues.io.top_priority
     // Connect txQueues IO
     txQueues.io.net_in <> txQueue_in.get
     io.net.get.out <> txQueues.io.net_out
@@ -409,6 +421,7 @@ class CSRFile(
 
   val mip = Wire(init=reg_mip)
   mip.lip := (io.interrupts.lip: Seq[Bool])
+  mip.lnip := rxQueues.io.interrupt // wire up LNIC interrupt
   mip.mtip := io.interrupts.mtip
   mip.msip := io.interrupts.msip
   mip.meip := io.interrupts.meip
@@ -541,7 +554,11 @@ class CSRFile(
   if (usingLNIC) {
     read_mapping += CSRs.lmsgsrdy -> reg_lmsgsrdy.get
     read_mapping += CSRs.lcurcontext -> reg_lcurcontext.get
+    read_mapping += CSRs.lcurpriority -> reg_lcurpriority.get
     read_mapping += CSRs.lniccmd -> 0.U
+    read_mapping += CSRs.ltargetcontext -> reg_ltargetcontext.get
+    read_mapping += CSRs.ltargetpriority -> reg_ltargetpriority.get
+    read_mapping += CSRs.lidle -> 0.U
     if (lnicUsingCSRs) {
       read_mapping += CSRs.lread -> rxQueue_out.get.bits
       read_mapping += CSRs.lwrite -> 0.U
@@ -608,8 +625,8 @@ class CSRFile(
       Bool(usingDebug) && decodeAny(debug_csrs) && !reg_debug ||
       io_dec.fp_csr && io_dec.fp_illegal
     io_dec.write_illegal := io_dec.csr(11,10).andR
-    // Do not flush the pipeline on writes to LNIC head/tail CSR regs
-    io_dec.write_flush := !(io_dec.csr >= CSRs.mscratch && io_dec.csr <= CSRs.mtval || io_dec.csr >= CSRs.sscratch && io_dec.csr <= CSRs.stval || io_dec.csr === CSRs.lread || io_dec.csr === CSRs.lwrite)
+    // Do not flush the pipeline on writes to LNIC CSRs
+    io_dec.write_flush := !(io_dec.csr >= CSRs.mscratch && io_dec.csr <= CSRs.mtval || io_dec.csr >= CSRs.sscratch && io_dec.csr <= CSRs.stval || (io_dec.csr >= CSRs.lread && io_dec.csr <= CSRs.ltargetpriority))
     io_dec.system_illegal := reg_mstatus.prv < io_dec.csr(9,8) ||
       is_wfi && !allow_wfi ||
       is_ret && !allow_sret ||
@@ -786,8 +803,14 @@ class CSRFile(
       when (decoded_addr(CSRs.lcurcontext)) {
         reg_lcurcontext.get := wdata
       }
+      when (decoded_addr(CSRs.lcurpriority)) {
+        reg_lcurpriority.get := wdata
+      }
       when (decoded_addr(CSRs.lniccmd)) {
         insert_context := wdata(0).asBool
+      }
+      when (decoded_addr(CSRs.lidle)) {
+        app_idle := wdata(0).asBool
       }
     }
 
@@ -805,38 +828,6 @@ class CSRFile(
       val csr_ren = io.rw.cmd.isOneOf(CSR.R, CSR.I, CSR.W, CSR.S, CSR.C)
       rxQueue_out.get.ready := csr_ren && decoded_addr(CSRs.lread)
     }
-
-// TODO(sibanez): move this state machine into the pktization buffer and have one per context
-//    /****************************************/
-//    /* LNIC txQueue_in.bits.last/keep logic */
-//    /****************************************/
-//    val txMsgLen = RegInit(0.U(16.W))
-//    val sTxWaitFirstWord :: sTxWaitLastWord :: Nil = Enum(2)
-//    val txMsgState = RegInit(sTxWaitFirstWord)
-//
-//    switch (txMsgState) {
-//      is (sTxWaitFirstWord) {
-//        when (txQueue_in.get.valid && txQueue_in.get.ready) {
-//          // record msg length
-//          txMsgLen := txQueue_in.get.bits.data(15, 0)
-//          // write txQueue_meta_in
-//          txQueue_meta_in.get.valid := true.B
-//          txMsgState := sTxWaitLastWord
-//        }
-//      }
-//      is (sTxWaitLastWord) {
-//        when (txQueue_in.get.valid && txQueue_in.get.ready) {
-//          when (txMsgLen > LNICConsts.NET_IF_BYTES.U) {
-//            txMsgLen := txMsgLen - LNICConsts.NET_IF_BYTES.U
-//          }.otherwise {
-//            txQueue_in.get.bits.last := true.B
-//            txQueue_in.get.bits.keep := (1.U << txMsgLen) - 1.U
-//            txMsgLen := 0.U
-//            txMsgState := sTxWaitFirstWord
-//          }
-//        }
-//      }
-//    }
 
     /**********************************/
     /* LNIC lmsgsrdy CSR update logic */
