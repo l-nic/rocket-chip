@@ -59,7 +59,7 @@ case class LNICParams(
   usingLNIC: Boolean = false,
   usingGPRs: Boolean = false,
   maxNumContexts: Int = 2,
-  rxBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
+  rxBufFlits: Int = 8 * LNICConsts.ETH_MAX_FLITS,
   pktizePktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
   arbiterPktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
   arbiterMetaBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
