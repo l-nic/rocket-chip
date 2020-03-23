@@ -338,7 +338,7 @@ class ArbiterIO extends Bundle {
   val core_meta_in = Flipped(Valid(new PktizeMetaOut))
   val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
   val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
-  val meta_out = Valid(new PISAMetaIn)
+  val meta_out = Valid(new PISAMetaIO)
 
   override def cloneType = new ArbiterIO().asInstanceOf[this.type]
 }
@@ -348,8 +348,8 @@ class LNICArbiter(implicit p: Parameters) extends Module {
   val io = IO(new ArbiterIO)
 
   val pktQueue_in = Wire(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
-  val metaQueue_in = Wire(Decoupled(new PISAMetaIn))
-  val metaQueue_out = Wire(Flipped(Decoupled(new PISAMetaIn)))
+  val metaQueue_in = Wire(Decoupled(new PISAMetaIO))
+  val metaQueue_out = Wire(Flipped(Decoupled(new PISAMetaIO)))
 
   // Set up output queues
   io.net_out <> Queue(pktQueue_in, p(LNICKey).arbiterPktBufFlits)
@@ -376,6 +376,10 @@ class LNICArbiter(implicit p: Parameters) extends Module {
   metaQueue_in.bits.msg_id := 0.U
   metaQueue_in.bits.offset := 0.U
   metaQueue_in.bits.lnic_src := 0.U
+  // initialize unused metadata fields (driven by PISA module)
+  metaQueue_in.bits.egress_id := 0.U;
+  metaQueue_in.bits.lnic_dst := 0.U;
+  metaQueue_in.bits.msg_len := 0.U;
 
   io.core_in.ready := false.B
   io.net_in.ready := false.B
@@ -469,10 +473,10 @@ class LNICArbiter(implicit p: Parameters) extends Module {
  */
 class SplitIO extends Bundle {
   val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
-  val meta_in = Flipped(Valid(new PISAMetaOut))
+  val meta_in = Flipped(Valid(new PISAMetaIO))
   val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
   val core_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
-  val core_meta_out = Valid(new PISAMetaOut)
+  val core_meta_out = Valid(new PISAMetaIO)
 
   override def cloneType = new SplitIO().asInstanceOf[this.type]
 }
@@ -534,7 +538,7 @@ class LNICSplit(implicit p: Parameters) extends Module {
  */
 class AssembleIO extends Bundle {
   val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
-  val meta_in = Flipped(Valid(new PISAMetaOut))
+  val meta_in = Flipped(Valid(new PISAMetaIO))
   val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
   val meta_out = Valid(new AssembleMetaOut)
 
@@ -552,8 +556,8 @@ class LNICAssemble(implicit p: Parameters) extends Module {
   val io = IO(new AssembleIO)
 
   val pktQueue_in = Wire(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
-  val metaQueue_in = Wire(Decoupled(new PISAMetaOut))
-  val metaQueue_out = Wire(Flipped(Decoupled(new PISAMetaOut)))
+  val metaQueue_in = Wire(Decoupled(new PISAMetaIO))
+  val metaQueue_out = Wire(Flipped(Decoupled(new PISAMetaIO)))
 
   io.net_out <> Queue(pktQueue_in, p(LNICKey).assemblePktBufFlits)
   io.net_in.ready := pktQueue_in.ready

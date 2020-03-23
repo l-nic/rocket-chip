@@ -155,17 +155,17 @@ class LNICModuleImp(outer: LNIC)(implicit p: Parameters) extends LazyModuleImp(o
 
   // NIC datapath
   val arbiter = Module(new LNICArbiter)
-  val pisa = Module(new LNICPISA)
+  val pisa = Module(new SDNetWrapper)
   val split = Module(new LNICSplit)
   val assemble = Module(new LNICAssemble)
 
   arbiter.io.core_in <> io.core.in
   arbiter.io.core_meta_in <> io.core.meta_in
   arbiter.io.net_in <> io.net.in
-  pisa.io.net_in <> arbiter.io.net_out
-  pisa.io.meta_in <> arbiter.io.meta_out
-  split.io.net_in <> pisa.io.net_out
-  split.io.meta_in <> pisa.io.meta_out
+  pisa.io.net.net_in <> arbiter.io.net_out
+  pisa.io.net.meta_in <> arbiter.io.meta_out
+  split.io.net_in <> pisa.io.net.net_out
+  split.io.meta_in <> pisa.io.net.meta_out
   io.net.out <> split.io.net_out
   assemble.io.net_in <> split.io.core_out
   assemble.io.meta_in <> split.io.core_meta_out
