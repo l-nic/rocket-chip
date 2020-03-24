@@ -159,6 +159,9 @@ class LNICModuleImp(outer: LNIC)(implicit p: Parameters) extends LazyModuleImp(o
   val split = Module(new LNICSplit)
   val assemble = Module(new LNICAssemble)
 
+  pisa.io.clock := clock
+  pisa.io.reset := reset
+
   arbiter.io.core_in <> io.core.in
   arbiter.io.core_meta_in <> io.core.meta_in
   arbiter.io.net_in <> io.net.in

@@ -50,6 +50,7 @@ class SDNetWrapper extends BlackBox with HasBlackBoxResource {
     val net = new LNICPISAIO
   })
   /* TODO(sibanez): SDNetWrapper SystemVerilog file added by Python post-processing script. */
+//  addClock(Driver.implicitClock)
 }
 
 // /**

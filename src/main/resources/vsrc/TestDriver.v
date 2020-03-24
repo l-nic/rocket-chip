@@ -81,8 +81,11 @@ module TestDriver;
 `define VCDPLUSON $fsdbDumpon;
 `define VCDPLUSCLOSE $fsdbDumpoff;
 `elsif VCS
-`define VCDPLUSON $vcdpluson(0); $vcdplusmemon(0);
-`define VCDPLUSCLOSE $vcdplusclose; $dumpoff;
+//`define VCDPLUSON $vcdpluson(0); $vcdplusmemon(0);
+//`define VCDPLUSCLOSE $vcdplusclose; $dumpoff;
+// NOTE(sibanez): disabled vcdplus logging to improve runtime speed
+`define VCDPLUSON
+`define VCDPLUSCLOSE
 `else
 `define VCDPLUSON $dumpon;
 `define VCDPLUSCLOSE $dumpoff;
