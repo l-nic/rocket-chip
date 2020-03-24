@@ -48,13 +48,6 @@ object LNICConsts {
   val NIC_IP_ADDR = "h0A000001".U // 10.0.0.1
 }
 
-object NetworkHelpers {
-  def reverse_bytes(a: UInt, n: Int) = {
-    val bytes = (0 until n).map(i => a((i + 1) * 8 - 1, i * 8))
-    Cat(bytes)
-  }
-}
-
 case class LNICParams(
   usingLNIC: Boolean = false,
   usingGPRs: Boolean = false,
@@ -74,30 +67,6 @@ case class LNICParams(
 )
 
 case object LNICKey extends Field[LNICParams]
-
-/**
- * NOTE: Copied StreamChannel and StreamIO here to remove dependency on testchipip
- */
-
-class StreamChannel(val w: Int) extends Bundle {
-  val data = UInt(w.W)
-  val keep = UInt((w/8).W)
-  val last = Bool()
-
-  override def cloneType = new StreamChannel(w).asInstanceOf[this.type]
-}
-
-class StreamIO(w: Int) extends Bundle {
-  val in = Flipped(Decoupled(new StreamChannel(w)))
-  val out = Decoupled(new StreamChannel(w))
-
-  def flipConnect(other: StreamIO) {
-    in <> other.out
-    other.in <> out
-  }
-
-  override def cloneType = new StreamIO(w).asInstanceOf[this.type]
-}
 
 class NetToCoreMeta extends AssembleMetaOut {
   override def cloneType = new NetToCoreMeta().asInstanceOf[this.type]
