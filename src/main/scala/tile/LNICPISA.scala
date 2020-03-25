@@ -35,9 +35,9 @@ class PISAMetaIO extends Bundle {
  * All IO for the LNIC PISA module.
  */
 class LNICPISAIO extends Bundle {
-  val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
+  val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH)))
   val meta_in = Flipped(Valid (new PISAMetaIO))
-  val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
+  val net_out = Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH))
   val meta_out = Valid(new PISAMetaIO)
 
   override def cloneType = new LNICPISAIO().asInstanceOf[this.type]

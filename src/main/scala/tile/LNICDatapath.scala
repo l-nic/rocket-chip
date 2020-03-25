@@ -334,10 +334,10 @@ class LNICPktize(implicit p: Parameters) extends Module {
  * LNIC Arbiter classes
  */
 class ArbiterIO extends Bundle {
-  val core_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
+  val core_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH)))
   val core_meta_in = Flipped(Valid(new PktizeMetaOut))
-  val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
-  val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
+  val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH)))
+  val net_out = Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH))
   val meta_out = Valid(new PISAMetaIO)
 
   override def cloneType = new ArbiterIO().asInstanceOf[this.type]
@@ -347,7 +347,7 @@ class ArbiterIO extends Bundle {
 class LNICArbiter(implicit p: Parameters) extends Module {
   val io = IO(new ArbiterIO)
 
-  val pktQueue_in = Wire(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
+  val pktQueue_in = Wire(Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH)))
   val metaQueue_in = Wire(Decoupled(new PISAMetaIO))
   val metaQueue_out = Wire(Flipped(Decoupled(new PISAMetaIO)))
 
@@ -472,10 +472,10 @@ class LNICArbiter(implicit p: Parameters) extends Module {
  *   - Combinationally split PISA pipeline output to network and core
  */
 class SplitIO extends Bundle {
-  val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
+  val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH)))
   val meta_in = Flipped(Valid(new PISAMetaIO))
-  val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
-  val core_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
+  val net_out = Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH))
+  val core_out = Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH))
   val core_meta_out = Valid(new PISAMetaIO)
 
   override def cloneType = new SplitIO().asInstanceOf[this.type]
@@ -609,7 +609,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
           // msg is too short - need to pad it
           state := sPad
           pktQueue_in.bits.last := false.B
-          pktQueue_in.bits.keep := LNICConsts.NET_FULL_KEEP
+          pktQueue_in.bits.keep := LNICConsts.NET_IF_FULL_KEEP
         } .elsewhen (reg_msg_len <= LNICConsts.NET_IF_BYTES.U && !io.net_in.bits.last) {
           // msg is too long - need to truncate it
           state := sTruncate

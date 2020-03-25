@@ -18,18 +18,25 @@ object LNICConsts {
   val NET_IF_BYTES = NET_IF_WIDTH/8
   val NET_LEN_BITS = 16
 
+  val NET_DP_WIDTH = 512
+  val NET_DP_BYTES = NET_DP_WIDTH/8
+
   val ETH_MAX_BYTES = 1520
   val ETH_MIN_BYTES = 64
   val ETH_HEAD_BYTES = 14
   val ETH_MAC_BITS = 48
   val ETH_TYPE_BITS = 16
 
-  val ETH_MAX_FLITS = ETH_MAX_BYTES/NET_IF_BYTES
-  val ETH_MIN_FLITS = ETH_MIN_BYTES/NET_IF_BYTES
+  val NET_IF_ETH_MAX_FLITS = ETH_MAX_BYTES/NET_IF_BYTES
+  val NET_IF_ETH_MIN_FLITS = ETH_MIN_BYTES/NET_IF_BYTES
+
+  val NET_DP_ETH_MAX_FLITS = ETH_MAX_BYTES/NET_DP_BYTES
+  val NET_DP_ETH_MIN_FLITS = ETH_MIN_BYTES/NET_DP_BYTES
 
   val IPV4_HEAD_BYTES = 20
 
-  def NET_FULL_KEEP = ~0.U(NET_IF_BYTES.W)
+  def NET_IF_FULL_KEEP = ~0.U(NET_IF_BYTES.W)
+  def NET_DP_FULL_KEEP = ~0.U(NET_DP_BYTES.W)
   def ETH_BCAST_MAC = ~0.U(ETH_MAC_BITS.W)
 
   val LWRITE_ADDR = 31.U
@@ -52,18 +59,18 @@ case class LNICParams(
   usingLNIC: Boolean = false,
   usingGPRs: Boolean = false,
   maxNumContexts: Int = 2,
-  rxBufFlits: Int = 8 * LNICConsts.ETH_MAX_FLITS,
-  pktizePktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
-  arbiterPktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
-  arbiterMetaBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
-  assemblePktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
-  assembleMetaBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
-  parserPktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
-  parserMetaBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
-  maPktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
-  maMetaBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
-  deparserPktBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS,
-  deparserMetaBufFlits: Int = 2 * LNICConsts.ETH_MAX_FLITS
+  rxBufFlits:           Int = 8 * LNICConsts.NET_IF_ETH_MAX_FLITS,
+  pktizePktBufFlits:    Int = 2 * LNICConsts.NET_IF_ETH_MAX_FLITS,
+  arbiterPktBufFlits:   Int = 2 * LNICConsts.NET_DP_ETH_MAX_FLITS,
+  arbiterMetaBufFlits:  Int = 2 * LNICConsts.NET_DP_ETH_MAX_FLITS,
+  assemblePktBufFlits:  Int = 2 * LNICConsts.NET_IF_ETH_MAX_FLITS,
+  assembleMetaBufFlits: Int = 2 * LNICConsts.NET_IF_ETH_MAX_FLITS,
+  parserPktBufFlits:    Int = 2 * LNICConsts.NET_DP_ETH_MAX_FLITS,
+  parserMetaBufFlits:   Int = 2 * LNICConsts.NET_DP_ETH_MAX_FLITS,
+  maPktBufFlits:        Int = 2 * LNICConsts.NET_DP_ETH_MAX_FLITS,
+  maMetaBufFlits:       Int = 2 * LNICConsts.NET_DP_ETH_MAX_FLITS,
+  deparserPktBufFlits:  Int = 2 * LNICConsts.NET_DP_ETH_MAX_FLITS,
+  deparserMetaBufFlits: Int = 2 * LNICConsts.NET_DP_ETH_MAX_FLITS
 )
 
 case object LNICKey extends Field[LNICParams]
@@ -131,16 +138,28 @@ class LNICModuleImp(outer: LNIC)(implicit p: Parameters) extends LazyModuleImp(o
   pisa.io.clock := clock
   pisa.io.reset := reset
 
-  arbiter.io.core_in <> io.core.in
-  arbiter.io.core_meta_in <> io.core.meta_in
-  arbiter.io.net_in <> io.net.in
+  // 64-bit => 512-bit
+  StreamWidthAdapter(arbiter.io.core_in,
+                     arbiter.io.core_meta_in,
+                     io.core.in,
+                     io.core.meta_in)
+  StreamWidthAdapter(arbiter.io.net_in,
+                     io.net.in)
+
   pisa.io.net.net_in <> arbiter.io.net_out
   pisa.io.net.meta_in <> arbiter.io.meta_out
   split.io.net_in <> pisa.io.net.net_out
   split.io.meta_in <> pisa.io.net.meta_out
-  io.net.out <> split.io.net_out
   assemble.io.net_in <> split.io.core_out
   assemble.io.meta_in <> split.io.core_meta_out
+
+  // 512-bit => 64-bit
+  StreamWidthAdapter(assemble.io.net_in,
+                     assemble.io.meta_in,
+                     split.io.core_out,
+                     split.io.core_meta_out)
+  StreamWidthAdapter(io.net.out,
+                     split.io.net_out)
   io.core.out <> assemble.io.net_out
   io.core.meta_out <> assemble.io.meta_out
 }
