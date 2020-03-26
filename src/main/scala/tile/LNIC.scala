@@ -498,7 +498,7 @@ class PktGen (pktLen: Int = 64) extends Module {
   io.net.in.ready := true.B
   io.net.out.valid := false.B
   io.net.out.bits.data := 0.U
-  io.net.out.bits.keep := LNICConsts.NET_FULL_KEEP
+  io.net.out.bits.keep := LNICConsts.NET_IF_FULL_KEEP
   io.net.out.bits.last := 0.U
 
   switch (state) {

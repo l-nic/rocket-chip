@@ -138,20 +138,20 @@ class StreamWidener[T <: Data](inW: Int, outW: Int, metaType: T) extends Module 
   when (io.out.fire()) {
     idx := 0.U
     keep.foreach(_ := 0.U)
-    state := s_recv
+    state := s_recv_first
   }
 }
 
 object StreamWidthAdapter {
   def apply[T <: Data](out: DecoupledIO[StreamChannel], meta_out: T, in: DecoupledIO[StreamChannel], meta_in: T) {
     if (out.bits.w > in.bits.w) {
-      val widener = Module(new StreamWidener(in.bits.w, out.bits.w, chiselTypeOf(meta_out.bits)))
+      val widener = Module(new StreamWidener(in.bits.w, out.bits.w, chiselTypeOf(meta_out)))
       widener.io.in <> in
       widener.io.meta_in := meta_in
       out <> widener.io.out
       meta_out := widener.io.meta_out
     } else if (out.bits.w < in.bits.w) {
-      val narrower = Module(new StreamNarrower(in.bits.w, out.bits.w, chiselTypeOf(meta_out.bits)))
+      val narrower = Module(new StreamNarrower(in.bits.w, out.bits.w, chiselTypeOf(meta_out)))
       narrower.io.in <> in
       narrower.io.meta_in := meta_in
       out <> narrower.io.out
@@ -164,11 +164,11 @@ object StreamWidthAdapter {
 
   def apply(out: DecoupledIO[StreamChannel], in: DecoupledIO[StreamChannel]) {
     if (out.bits.w > in.bits.w) {
-      val widener = Module(new StreamWidener(in.bits.w, out.bits.w, Bool))
+      val widener = Module(new StreamWidener(in.bits.w, out.bits.w, Bool()))
       widener.io.in <> in
       out <> widener.io.out
     } else if (out.bits.w < in.bits.w) {
-      val narrower = Module(new StreamNarrower(in.bits.w, out.bits.w, Bool))
+      val narrower = Module(new StreamNarrower(in.bits.w, out.bits.w, Bool()))
       narrower.io.in <> in
       out <> narrower.io.out
     } else {

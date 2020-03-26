@@ -139,7 +139,7 @@ class LNICPktize(implicit p: Parameters) extends Module {
 
   io.net_out.valid := false.B
   io.net_out.bits.data := 0.U
-  io.net_out.bits.keep := LNICConsts.NET_FULL_KEEP
+  io.net_out.bits.keep := LNICConsts.NET_IF_FULL_KEEP
   io.net_out.bits.last := false.B
 
   io.meta_out.valid := false.B
