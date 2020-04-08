@@ -13,44 +13,67 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util._
 import NetworkHelpers._
 
-class PISAMetaIO extends Bundle {
-  /* PISA Inputs */
-  val ingress_id = Bool() // 0 = network, 1 = CPU
-
-  // metadata for pkts from CPU only (set by pktization buffer)
-  val msg_id = UInt(16.W)
-  val offset = UInt(16.W) // pkt offset within msg
-  val lnic_src = UInt(LNICConsts.LNIC_CONTEXT_BITS.W) // src context ID
-
-  /* PISA Outputs */
-  val egress_id = Bool() // 0 = network, 1 = CPU
-  // metadata for pkt going to CPU
-  val lnic_dst = UInt(LNICConsts.LNIC_CONTEXT_BITS.W) // dst context ID from LNIC hdr
+class PISAIngressMetaOut extends Bundle {
+  // metadata for pkts going to CPU
+  val src_ip = UInt(32.W)
+  val lnic_src = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
+  val offset = UInt(16.W)
+  val lnic_dst = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
   val msg_len = UInt(16.W)
 
-  override def cloneType = new PISAMetaIO().asInstanceOf[this.type]
+  override def cloneType = new PISAIngressMetaIO().asInstanceOf[this.type]
+}
+
+class PISAEgressMetaIn extends Bundle {
+  // metadata for pkts coming from CPU
+  val dst_ip = UInt(32.W)
+  val lnic_dst = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
+  val offset = UInt(16.W)
+  val msg_len = UInt(16.W)
+  val msg_id = UInt(16.W)
+  val lnic_src = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
+
+  override def cloneType = new PISAEgressMetaIO().asInstanceOf[this.type]
 }
 
 /**
- * All IO for the LNIC PISA module.
+ * All IO for the LNIC PISA Ingress module.
  */
-class LNICPISAIO extends Bundle {
+class LNICPISAIngressIO extends Bundle {
   val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH)))
-  val meta_in = Flipped(Valid (new PISAMetaIO))
   val net_out = Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH))
-  val meta_out = Valid(new PISAMetaIO)
+  val meta_out = Valid(new PISAIngressMetaOut)
 
-  override def cloneType = new LNICPISAIO().asInstanceOf[this.type]
+  override def cloneType = new LNICPISAIngressIO().asInstanceOf[this.type]
 }
 
-class SDNetWrapper extends BlackBox with HasBlackBoxResource {
+/**
+ * All IO for the LNIC PISA Egress module.
+ */
+class LNICPISAEgressIO extends Bundle {
+  val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH)))
+  val meta_in = Valid(new PISAEgressMetaIn)
+  val net_out = Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH))
+
+  override def cloneType = new LNICPISAEgressIO().asInstanceOf[this.type]
+}
+
+/* Ingress Pipeline Blackbox */
+class SDNetIngressWrapper extends BlackBox with HasBlackBoxResource {
   val io = IO(new Bundle {
     val clock = Input(Clock())
     val reset = Input(Bool())
-    val net = new LNICPISAIO
+    val net = new LNICPISAIngressIO
   })
-  /* TODO(sibanez): SDNetWrapper SystemVerilog file added by Python post-processing script. */
-//  addClock(Driver.implicitClock)
+}
+
+/* Egress Pipeline Blackbox */
+class SDNetEgressWrapper extends BlackBox with HasBlackBoxResource {
+  val io = IO(new Bundle {
+    val clock = Input(Clock())
+    val reset = Input(Bool())
+    val net = new LNICPISAEgressIO
+  })
 }
 
 // /**

@@ -130,36 +130,30 @@ class LNICModuleImp(outer: LNIC)(implicit p: Parameters) extends LazyModuleImp(o
   val io = IO(new LNICIO)
 
   // NIC datapath
-  val arbiter = Module(new LNICArbiter)
-  val pisa = Module(new SDNetWrapper)
-  val split = Module(new LNICSplit)
+  val pisa_ingress = Module(new SDNetIngressWrapper)
+  val pisa_egress = Module(new SDNetEgressWrapper)
   val assemble = Module(new LNICAssemble)
 
-  pisa.io.clock := clock
-  pisa.io.reset := reset
+  pisa_ingress.io.clock := clock
+  pisa_ingress.io.reset := reset
+  pisa_egress.io.clock := clock
+  pisa_egress.io.reset := reset
 
   // 64-bit => 512-bit
-  StreamWidthAdapter(arbiter.io.core_in,
-                     arbiter.io.core_meta_in,
+  StreamWidthAdapter(pisa_egress.io.net.net_in,
+                     pisa_egress.io.net.meta_in,
                      io.core.in,
                      io.core.meta_in)
-  StreamWidthAdapter(arbiter.io.net_in,
+  StreamWidthAdapter(pisa_ingress.io.net.net_in,
                      io.net.in)
-
-  pisa.io.net.net_in <> arbiter.io.net_out
-  pisa.io.net.meta_in <> arbiter.io.meta_out
-  split.io.net_in <> pisa.io.net.net_out
-  split.io.meta_in <> pisa.io.net.meta_out
-  assemble.io.net_in <> split.io.core_out
-  assemble.io.meta_in <> split.io.core_meta_out
 
   // 512-bit => 64-bit
   StreamWidthAdapter(assemble.io.net_in,
                      assemble.io.meta_in,
-                     split.io.core_out,
-                     split.io.core_meta_out)
+                     pisa_ingress.io.net.net_out,
+                     pisa_ingress.io.net.meta_out)
   StreamWidthAdapter(io.net.out,
-                     split.io.net_out)
+                     pisa_egress.io.net.net_out)
   io.core.out <> assemble.io.net_out
   io.core.meta_out <> assemble.io.meta_out
 }

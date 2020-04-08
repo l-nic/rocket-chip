@@ -332,6 +332,8 @@ class LNICPktize(implicit p: Parameters) extends Module {
 
 /**
  * LNIC Arbiter classes
+ * TODO(sibanez): repurpose this module to schedule between control and data
+ *   pkts on the TX path.
  */
 class ArbiterIO extends Bundle {
   val core_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH)))
@@ -466,68 +468,6 @@ class LNICArbiter(implicit p: Parameters) extends Module {
 }
 
 /**
- * LNIC Split classes.
- *
- * Tasks:
- *   - Combinationally split PISA pipeline output to network and core
- */
-class SplitIO extends Bundle {
-  val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH)))
-  val meta_in = Flipped(Valid(new PISAMetaIO))
-  val net_out = Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH))
-  val core_out = Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH))
-  val core_meta_out = Valid(new PISAMetaIO)
-
-  override def cloneType = new SplitIO().asInstanceOf[this.type]
-}
-
-@chiselName
-class LNICSplit(implicit p: Parameters) extends Module {
-  val io = IO(new SplitIO)
-
-  // state machine to split output
-  val sWordOne :: sWaitEnd :: Nil = Enum(2)
-  val state = RegInit(sWordOne)
-
-  val reg_egress_id = RegInit(false.B)
-
-  io.core_out.bits := io.net_in.bits
-  io.core_meta_out.bits := io.meta_in.bits
-  io.net_out.bits := io.net_in.bits
-
-  // default
-  io.core_meta_out.valid := false.B
-
-  switch (state) {
-    is (sWordOne) {
-      io.net_in.ready := Mux(io.meta_in.bits.egress_id, io.core_out.ready, io.net_out.ready)
-      // connect core outputs
-      io.core_out.valid := io.meta_in.bits.egress_id && io.net_in.valid
-      io.core_meta_out.valid := io.core_out.valid
-      // connect net outputs
-      io.net_out.valid := !io.meta_in.bits.egress_id && io.net_in.valid
-      when (io.net_in.valid && io.net_in.ready) {
-        reg_egress_id := io.meta_in.bits.egress_id
-        // next state logic
-        when (!io.net_in.bits.last) {
-          state := sWaitEnd
-        }
-      }
-    }
-    is (sWaitEnd) {
-      io.net_in.ready := Mux(reg_egress_id, io.core_out.ready, io.net_out.ready)
-      // connect core outputs
-      io.core_out.valid := reg_egress_id && io.net_in.valid
-      // connect net outputs
-      io.net_out.valid := !reg_egress_id && io.net_in.valid
-      when (io.net_in.valid && io.net_in.ready && io.net_in.bits.last) {
-        state := sWordOne
-      }
-    }
-  }
-}
-
-/**
  * LNIC Assemble classes.
  *
  * Tasks:
@@ -538,7 +478,7 @@ class LNICSplit(implicit p: Parameters) extends Module {
  */
 class AssembleIO extends Bundle {
   val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
-  val meta_in = Flipped(Valid(new PISAMetaIO))
+  val meta_in = Flipped(Valid(new PISAIngressMetaOut))
   val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
   val meta_out = Valid(new AssembleMetaOut)
 
