@@ -13,6 +13,8 @@ import freechips.rocketchip.rocket._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util._
 
+import scala.collection.mutable.LinkedHashMap
+
 object LNICConsts {
   val NET_IF_WIDTH = 64
   val NET_IF_BYTES = NET_IF_WIDTH/8
@@ -46,6 +48,7 @@ object LNICConsts {
   val LNIC_PROTO = 0x99.U(8.W)
   val LNIC_HDR_BYTES = 14
   val LNIC_CONTEXT_BITS = 16
+  val LNIC_MSG_ID_BITS = 16
 
   val LNIC_PRIORITY_BITS = 8
   val TEST_CONTEXT_ID = 0x1234.U(LNIC_CONTEXT_BITS.W)
@@ -53,6 +56,15 @@ object LNICConsts {
   val SWITCH_MAC_ADDR = "h085566778808".U
   val NIC_MAC_ADDR = "h081122334408".U
   val NIC_IP_ADDR = "h0A000001".U // 10.0.0.1
+
+  val MAX_PKTS_PER_MSG = 16
+  val MAX_PKT_LEN_BYTES = 1024
+
+  // LinkedHashMap[Int, Int] : {buffer_size (bytes) => num_buffers}
+  val MSG_BUFFER_COUNT = LinkedHashMap(64  -> 64,
+                                       128 -> 32,
+                                       256 -> 16,
+                                       512 -> 8)
 }
 
 case class LNICParams(

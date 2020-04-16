@@ -16,10 +16,11 @@ import NetworkHelpers._
 class PISAIngressMetaOut extends Bundle {
   // metadata for pkts going to CPU
   val src_ip = UInt(32.W)
-  val lnic_src = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
-  val offset = UInt(16.W)
-  val lnic_dst = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
+  val src_context = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
+  val pkt_offset = UInt(16.W)
+  val dst_context = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
   val msg_len = UInt(16.W)
+  val rx_msg_id = UInt(LNICConsts.LNIC_MSG_ID_BITS.W)
 
   override def cloneType = new PISAIngressMetaIO().asInstanceOf[this.type]
 }

@@ -468,145 +468,12 @@ class LNICArbiter(implicit p: Parameters) extends Module {
 }
 
 /**
- * LNIC Assemble classes.
- *
- * Tasks:
- *   - Reassemble pkts going to CPU into messages
- *   - Reverse byte order of data going to CPU
- *   - Enforce message length
- *   - For now, assume all msgs consist of a single pkt and there is only one thread running on the core
- */
-class AssembleIO extends Bundle {
-  val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
-  val meta_in = Flipped(Valid(new PISAIngressMetaOut))
-  val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
-  val meta_out = Valid(new AssembleMetaOut)
-
-  override def cloneType = new AssembleIO().asInstanceOf[this.type]
-}
-
-class AssembleMetaOut extends Bundle {
-  val lnic_dst = UInt(LNICConsts.LNIC_CONTEXT_BITS.W) // dst context ID
-
-  override def cloneType = new AssembleMetaOut().asInstanceOf[this.type]
-}
-
-@chiselName
-class LNICAssemble(implicit p: Parameters) extends Module {
-  val io = IO(new AssembleIO)
-
-  val pktQueue_in = Wire(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
-  val metaQueue_in = Wire(Decoupled(new PISAMetaIO))
-  val metaQueue_out = Wire(Flipped(Decoupled(new PISAMetaIO)))
-
-  io.net_out <> Queue(pktQueue_in, p(LNICKey).assemblePktBufFlits)
-  io.net_in.ready := pktQueue_in.ready
-  metaQueue_out <> Queue(metaQueue_in, p(LNICKey).assembleMetaBufFlits)
-  metaQueue_in.valid := false.B
-  metaQueue_in.bits := io.meta_in.bits
-
-  // default - connect net_in to pktQueue
-  pktQueue_in <> io.net_in
-  // reverse byte order of data going to CPU
-  pktQueue_in.bits.data := reverse_bytes(io.net_in.bits.data, LNICConsts.NET_IF_BYTES)
-
-  // state machine to compute message length using pktQueue_in
-  val sStart :: sEnd :: Nil = Enum(2)
-  val stateMsgLen = RegInit(sStart)
-
-  val reg_msg_len = RegInit(0.U)
-
-  switch (stateMsgLen) {
-    is (sStart) {
-      when (pktQueue_in.valid && pktQueue_in.ready) {
-        reg_msg_len := io.meta_in.bits.msg_len
-        metaQueue_in.valid := true.B
-        assert (metaQueue_in.ready, "LNICAssemble: metaQueue is full!")
-        when (!pktQueue_in.bits.last) {
-          stateMsgLen := sEnd
-        }
-      }
-    }
-    is (sEnd) {
-      when (pktQueue_in.valid && pktQueue_in.ready) {
-        reg_msg_len := reg_msg_len - PopCount(pktQueue_in.bits.keep)
-        when (pktQueue_in.bits.last) {
-          stateMsgLen := sStart
-        }
-      }
-    }
-  }
-
-  // state machine to enforce message length
-  // NOTE: this will not work properly for single word messages (i.e. just app header)
-  val sIdle :: sTruncate :: sPad :: Nil = Enum(3)
-  val state = RegInit(sIdle)
-
-  switch (state) {
-    is (sIdle) {
-      when (io.net_in.valid && io.net_in.ready && stateMsgLen =/= sStart) {
-        when (reg_msg_len > LNICConsts.NET_IF_BYTES.U && io.net_in.bits.last) {
-          // msg is too short - need to pad it
-          state := sPad
-          pktQueue_in.bits.last := false.B
-          pktQueue_in.bits.keep := LNICConsts.NET_IF_FULL_KEEP
-        } .elsewhen (reg_msg_len <= LNICConsts.NET_IF_BYTES.U && !io.net_in.bits.last) {
-          // msg is too long - need to truncate it
-          state := sTruncate
-          pktQueue_in.bits.last := true.B
-        }
-      }
-    }
-    is (sTruncate) {
-      pktQueue_in.valid := false.B
-      when (io.net_in.valid && io.net_in.ready && io.net_in.bits.last) {
-        state := sIdle
-      }
-    }
-    is (sPad) {
-      pktQueue_in.valid := true.B
-      pktQueue_in.bits.data := 0.U
-      when (pktQueue_in.ready && reg_msg_len <= LNICConsts.NET_IF_BYTES.U) {
-        state := sIdle
-        pktQueue_in.bits.last := true.B
-        pktQueue_in.bits.keep := (1.U << reg_msg_len) - 1.U
-      }
-    }
-  }
-
-  // state machine to drive io.meta_out and read metaQueue
-  val stateMetaOut = RegInit(sStart)
-
-  switch (stateMetaOut) {
-    is (sStart) {
-        // io.meta_out is valid on the first word
-        io.meta_out.valid := metaQueue_out.valid
-        io.meta_out.bits.lnic_dst := metaQueue_out.bits.lnic_dst
-        when (io.net_out.valid && io.net_out.ready) {
-          metaQueue_out.ready := io.net_out.bits.last
-          when (!io.net_out.bits.last) {
-            stateMetaOut := sEnd
-          }
-        }
-    }
-    is (sEnd) {
-      when (io.net_out.valid && io.net_out.ready && io.net_out.bits.last) {
-        metaQueue_out.ready := true.B
-        stateMetaOut := sStart
-      }
-    }
-  }
-
-}
-
-
-/**
  * LNIC Per-Context FIFO queues and interrupt generation.
  *
  * Tasks:
  *   - Receive messages from the reassembly buffer.
  *   - The messages indicate which context they are for.
- *   - If the corresponding FIFO is full then drop the message.
+ *   - If the corresponding FIFO is full then drop the message. TODO(sibanez): update this to exert back-pressure instead.
  *   - Otherwise, write the message into the FIFO by reading from the free list and adding to the appropriate linked-list.
  *   - If the message is for a context that has a higher priority than the current_priority input signal (0 is highest priority)
  *     then generate an interrupt and update top_context and top_priority output signals
@@ -680,7 +547,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
 
   val cur_index = io.cur_context
   val enq_index = Wire(UInt())
-  enq_index := io.meta_in.bits.lnic_dst // default
+  enq_index := io.meta_in.bits.dst_context // default
 
   val do_enq = Wire(Bool())
   val do_deq = Wire(Bool())
@@ -692,7 +559,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   freelist.io.enq.valid := false.B
   freelist.io.enq.bits := 0.U
   freelist.io.deq.ready := false.B
-  // don't receive incomming messages
+
   io.net_in.ready := false.B
 
   io.count := counts(io.cur_context)
@@ -724,46 +591,31 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
     counts(cur_index) := 0.U
   } .otherwise {
 
-    // State machine to perform enqueue & drop operations
-    // Drop message if:
-    //   (1) the FIFO does not have enough space
-    //   (2) the context ID is unallocated // TODO(sibanez): unused at the moment ...
-    val sStart :: sEnqueue :: sDrop :: Nil = Enum(3)
+    // State machine to perform enqueue operations
+    val sStart :: sEnqueue :: Nil = Enum(2)
     val enqState = RegInit(sStart)
 
     val reg_enq_index = RegInit(0.U(LNICConsts.LNIC_CONTEXT_BITS.W))
 
-    // this module should not assert back pressure (except during context insertion)
-    io.net_in.ready := true.B
+    // assert backpressure if the current context is consuming too much space
+    io.net_in.ready := counts(enq_index) < max_qsize.U
 
     switch(enqState) {
       is (sStart) {
-        when (io.net_in.valid) {
-          val msg_len = io.net_in.bits.data(15, 0)
-          val msg_words = (msg_len >> 3.U) + 1.U // NOTE: this is assuming 8B words
-          when (msg_words < (max_qsize.U - counts(enq_index))) {
-            // there is enough room, enqueue the msg
-            perform_enq(enq_index)
-            reg_enq_index := enq_index
-            enqState := sEnqueue
-          } .otherwise {
-            // there is NOT enough room, drop the msg
-            enqState := sDrop
-          }
+        when (io.net_in.valid && io.net_in.ready) {
+          // there is enough room, enqueue the msg
+          perform_enq(enq_index)
+          reg_enq_index := enq_index
+          enqState := sEnqueue
         }
       }
       is (sEnqueue) {
-        when (io.net_in.valid) {
+        when (io.net_in.valid && io.net_in.ready) {
           enq_index := reg_enq_index
           perform_enq(enq_index)
           when (io.net_in.bits.last) {
             enqState := sStart
           }
-        }
-      }
-      is (sDrop) {
-        when (io.net_in.valid && io.net_in.bits.last) {
-          enqState := sStart
         }
       }
     }
@@ -819,7 +671,6 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   when (reg_do_enq || reg_do_deq || reg_do_unread) {
     // Collect all context IDs (indicies) with count > 0 then select the one with the highest priority
 
-    // TODO(sibanez): implement this ...
     val context_ids = Wire(Vec(num_contexts, UInt(width = LNICConsts.LNIC_CONTEXT_BITS)))
     for (i <- 0 until context_ids.size) {
       context_ids(i) := i.U
@@ -926,24 +777,24 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
 
 }
 
-class FreeList(val entries: Int) extends Module {
+// entries is a Seq of UInt values with which to initialize the freelist.
+class FreeList(val entries: Seq[UInt]) extends Module {
   val io = IO(new Bundle {
     // enq ptrs into this module
-    val enq = Flipped(Decoupled(UInt(width = log2Ceil(entries))))
+    val enq = Flipped(Decoupled(chiselTypeOf(entries(0))))
     // deq ptrs from this module
-    val deq = Decoupled(UInt(width = log2Ceil(entries)))
+    val deq = Decoupled(chiselTypeOf(entries(0)))
   })
 
-  val ptrBits = log2Ceil(entries)
-
   // create FIFO queue to store pointers
-  val queue_in = Wire(Decoupled(UInt(width = ptrBits)))
-  val queue_out = Queue(queue_in, entries)
+  val queue_in = Wire(Decoupled(chiselTypeOf(entries(0))))
+  val queue_out = Queue(queue_in, entries.size())
 
   val sReset :: sIdle :: Nil = Enum(2)
   val state = RegInit(sReset)
 
-  val reg_ptr = RegInit(0.U(ptrBits.W))
+  val entries_vec = Vec(entries)
+  val index = RegInit(0.U(log2Ceil(entries.size()).W))
 
   // default - connect queue to enq/deq interfaces
   queue_in <> io.enq
@@ -955,13 +806,13 @@ class FreeList(val entries: Int) extends Module {
       io.enq.ready := false.B
       io.deq.valid := false.B
       queue_out.ready := false.B
-      // insert 0 - (entries-1) into the queue on reset
+      // insert entries into the queue on reset
       queue_in.valid := true.B
-      queue_in.bits := reg_ptr
+      queue_in.bits := entries_vec(index)
       when (queue_in.ready) {
-        reg_ptr := reg_ptr + 1.U
+        index := index + 1.U
       }
-      when (reg_ptr === (entries - 1).U) {
+      when (index === (entries.size() - 1).U) {
         state := sIdle
       }
     }
