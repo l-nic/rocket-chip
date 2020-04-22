@@ -28,11 +28,14 @@ class PISAIngressMetaOut extends Bundle {
 class PISAEgressMetaIn extends Bundle {
   // metadata for pkts coming from CPU
   val dst_ip = UInt(32.W)
-  val lnic_dst = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
-  val offset = UInt(16.W)
+  val dst_context = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
+  val pkt_offset = UInt(16.W)
   val msg_len = UInt(16.W)
-  val msg_id = UInt(16.W)
-  val lnic_src = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
+  val src_context = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
+  val tx_msg_id = UInt(LNICConsts.LNIC_MSG_ID_BITS.W)
+  // TODO(sibanez): update these bitwidths
+  val buf_ptr = UInt(LNICConsts.BUF_PTR_BITS.W)
+  val buf_size_class = UInt(16.W)
 
   override def cloneType = new PISAEgressMetaIO().asInstanceOf[this.type]
 }

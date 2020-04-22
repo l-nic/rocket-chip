@@ -107,6 +107,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
 
   /* Memories (i.e. tables) and Queues */
   // freelist to keep track of available rx_msg_ids
+  // TODO(sibanez): update FreeList initialization to use Seq[UInt]
   val rx_msg_id_freelist = Module(new FreeList(num_msg_buffers))
   // table mapping unique msg identifier to rx_msg_id
   // TODO(sibanez): this should eventually turn into a D-left exact-match table
@@ -141,7 +142,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
   // FIFO queue to schedule delivery of fully assembled msgs to the CPU
   // TODO(sibanez): this should become a PIFO ideally, or at least per-context queues each with an associated priority
   val scheduled_msgs_enq = Wire(Decoupled(new MsgDescriptor(buf_ptr_width))
-  val scheduled_msgs_enq = Wire(Flipped(Decoupled(new MsgDescriptor(buf_ptr_width)))
+  val scheduled_msgs_deq = Wire(Flipped(Decoupled(new MsgDescriptor(buf_ptr_width)))
   scheduled_msgs_deq <> Queue(scheduled_msgs_enq, num_msg_buffers)
 
   /* GetRxMsgInfo State Machine:
@@ -426,9 +427,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
   buf_net_out_wide.bits.last := false.B
   scheduled_msgs_deq.ready = false.B
 
-  // TODO(sibanez): update this depending on how the RxQueues module wants to assert backpressure.
-  // NOTE: the metadata here is treated differently than usual.
-  //   This dst_context metadata field is used to drive io.net_out.ready
+  // NOTE: This dst_context metadata field is used by the RxQueues Module to drive io.net_out.ready
   io.meta_out.valid := true.B
   io.meta_out.bits.dst_context := msg_desc_reg.dst_context
 

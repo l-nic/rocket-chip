@@ -60,11 +60,20 @@ object LNICConsts {
   val MAX_PKTS_PER_MSG = 16
   val MAX_PKT_LEN_BYTES = 1024
 
+  val BUF_PTR_BITS = 16
+  val SIZE_CLASS_BITS = 8
+  val PKT_OFFSET_BITS = 8
+  val MSG_LEN_BITS = 16
+
   // LinkedHashMap[Int, Int] : {buffer_size (bytes) => num_buffers}
   val MSG_BUFFER_COUNT = LinkedHashMap(64  -> 64,
                                        128 -> 32,
                                        256 -> 16,
                                        512 -> 8)
+
+  // This queue only builds up if pkts are being scheduled faster than
+  // they are being transmitted.
+  val SCHEDULED_PKTS_Q_DEPTH = 256
 }
 
 case class LNICParams(
@@ -91,7 +100,7 @@ class NetToCoreMeta extends AssembleMetaOut {
   override def cloneType = new NetToCoreMeta().asInstanceOf[this.type]
 }
 
-class CoreToNetMeta extends PktizeMetaOut {
+class CoreToNetMeta extends LNICTxQueueMetaOut {
   override def cloneType = new CoreToNetMeta().asInstanceOf[this.type]
 }
 
