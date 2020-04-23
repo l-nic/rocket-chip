@@ -183,7 +183,7 @@ class CSRDecodeIO extends Bundle {
 }
 
 class CSRTxCmd extends Bundle {
-  val cmd = Flipped(Decoupled(UInt(width = 64)))
+  val cmd = Flipped(Valid(UInt(width = 64)))
 }
 
 class CSRRxCmd extends Bundle {
@@ -360,8 +360,8 @@ class CSRFile(
   // rxQueue must be able to support unread operations for pipeline flushes if using GPRs
   val rxQueues = Module(new LNICRxQueues)
   val rxQueue_out = if (usingLNIC) Some(Wire(Flipped(Decoupled(UInt(width = xLen))))) else None
-  val txQueues = Module(new LNICPktize)
-  val txQueue_in = if (usingLNIC) Some(Wire(Decoupled(UInt(width = xLen)))) else None
+  val txQueues = Module(new LNICTxQueue)
+  val txQueue_in = if (usingLNIC) Some(Wire(Valid(UInt(width = xLen)))) else None
   // signal to tell rxQueues to register the current context
   val insert_context = Wire(Bool())
   insert_context := false.B // default
@@ -382,13 +382,11 @@ class CSRFile(
     reg_ltargetpriority.get := rxQueues.io.top_priority
     // Connect txQueues IO
     txQueues.io.net_in <> txQueue_in.get
-    io.net.get.out <> txQueues.io.net_out
-    io.net.get.meta_out <> txQueues.io.meta_out
+    io.net.get.net_out <> txQueues.io.net_out
     txQueues.io.cur_context := reg_lcurcontext.get
-    txQueues.io.insert := insert_context
+    //txQueues.io.insert := insert_context
     if (lnicUsingGPRs) {
       /* Wire up txQueue_in */
-      io.tx.get.cmd.ready := txQueue_in.get.ready
       txQueue_in.get.valid := io.tx.get.cmd.valid
       txQueue_in.get.bits := io.tx.get.cmd.bits
   

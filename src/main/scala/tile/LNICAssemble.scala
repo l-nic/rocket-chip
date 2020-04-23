@@ -12,6 +12,7 @@ import freechips.rocketchip.rocket._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util._
 import NetworkHelpers._
+import LNICConsts._
 
 /**
  * LNIC Assemble classes.
@@ -22,9 +23,9 @@ import NetworkHelpers._
  *   - Allocate rx_msg_ids and buffers to msgs
  */
 class AssembleIO extends Bundle {
-  val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH)))
+  val net_in = Flipped(Decoupled(new StreamChannel(NET_DP_BITS)))
   val meta_in = Flipped(Valid(new PISAIngressMetaOut))
-  val net_out = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
+  val net_out = Decoupled(new StreamChannel(XLEN))
   val meta_out = Valid(new AssembleMetaOut)
   val getRxMsgInfo = Flipped(new GetRxMsgInfoIO)
 
@@ -32,118 +33,71 @@ class AssembleIO extends Bundle {
 }
 
 class AssembleMetaOut extends Bundle {
-  val dst_context = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
+  val dst_context = UInt(LNIC_CONTEXT_BITS.W)
 }
 
-/* TODO(sibanez): move this to LNICPISA.scala */
-class GetRxMsgInfoIO extends Bundle {
-  val req = Valid(new GetRxMsgInfoReq)
-  val resp = Flipped(Valid(new GetRxMsgInfoResp))
-}
-
-class GetRxMsgInfoReq extends Bundle {
-  val src_ip = UInt(32.W)
-  val src_context = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
-  val tx_msg_id = UInt(LNICConsts.LNIC_MSG_ID_BITS.W)
-  val msg_len = UInt(16.W)
-}
-
-class GetRxMsgInfoResp extends Bundle {
-  val fail = Bool()
-  val rx_msg_id = UInt(LNICConsts.LNIC_MSG_ID_BITS.W)
-  // TODO(sibanez): add additional fields for transport processing
-}
-
-class BufInfoTableEntry(val buf_ptr_width: Int) extends Bundle {
-  val buf_ptr = UInt(buf_ptr_width.W)
-  val buf_size = UInt(16.W)
+class BufInfoTableEntry extends Bundle {
+  val buf_ptr = UInt(BUF_PTR_BITS.W)
+  val buf_size = UInt(MSG_LEN_BITS.W)
   // index of the corresponding size_class_freelist
-  val size_class = UInt(log2ceil(LNICConsts.MSG_BUFFER_COUNT.size()).W)
+  val size_class = UInt(SIZE_CLASS_BITS.W)
 }
 
 class RxMsgIdTableEntry extends Bundle {
   val valid = Bool()
-  val rx_msg_id = UInt(LNICConsts.LNIC_MSG_ID_BITS.W)
+  val rx_msg_id = UInt(LNIC_MSG_ID_BITS.W)
 }
 
 // The first word delivered to the application at the start of
 // every received msg
 class RxAppHdr extends Bundle {
   val src_ip = UInt(32.W)
-  val src_context = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
-  val msg_len = UInt(16.W)
+  val src_context = UInt(LNIC_CONTEXT_BITS.W)
+  val msg_len = UInt(MSG_LEN_BITS.W)
 }
 
-// The MsgDescriptor is the element that is actually scheduled.
+// The RxMsgDescriptor is the element that is actually scheduled.
 // It is inserted into the scheduler when the msg is fully reassembled.
 // When the scheduler selects a descriptor the dequeue logic uses
 // the info to deliver the indicated msg to the CPU.
-class MsgDescriptor(val buf_ptr_width: Int) extends Bundle {
-  val rx_msg_id = UInt(LNICConsts.LNIC_MSG_ID_BITS.W)
-  val size_class = UInt(log2ceil(LNICConsts.MSG_BUFFER_COUNT.size()).W)
-  val buf_ptr = UInt(buf_ptr_width.W)
-  val dst_context = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
+class RxMsgDescriptor(val buf_ptr_width: Int) extends Bundle {
+  val rx_msg_id = UInt(LNIC_MSG_ID_BITS.W)
+  val size_class = UInt(SIZE_CLASS_BITS.W)
+  val buf_ptr = UInt(BUF_PTR_BITS.W)
+  val dst_context = UInt(LNIC_CONTEXT_BITS.W)
   val rx_app_hdr = new RxAppHdr()
-}
-
-def compute_num_pkts(msg_len: UInt) = {
-  require(isPow2(LNICConsts.MAX_PKT_LEN_BYTES))
-  // check if msg_len is divisible by MAX_PKT_LEN_BYTES
-  val num_pkts = Mux(msg_len(log2ceil(LNICConsts.MAX_PKT_LEN_BYTES)-1, 0) === 0.U,
-                     msg_len >> log2ceil(LNICConsts.MAX_PKT_LEN_BYTES).U,
-                     msg_len >> log2ceil(LNICConsts.MAX_PKT_LEN_BYTES).U + 1.U)
-  num_pkts
 }
 
 @chiselName
 class LNICAssemble(implicit p: Parameters) extends Module {
   val io = IO(new AssembleIO)
 
-  // parameter computations
-  val num_msg_buffer_words = LNICConsts.MSG_BUFFER_COUNT.map( (size: Int, count: Int) => (size/LNICConsts.NET_DP_BYTES)*count ).reduce(_ + _)
-  val num_msg_buffers = LNICConsts.MSG_BUFFER_COUNT.map( (size: Int, count: Int) => count ).reduce(_ + _)
-  val buf_ptr_width = log2ceil(num_msg_buffer_words)
-  require (isPow2(num_msg_buffers))
-
   /* Memories (i.e. tables) and Queues */
   // freelist to keep track of available rx_msg_ids
-  // TODO(sibanez): update FreeList initialization to use Seq[UInt]
-  val rx_msg_id_freelist = Module(new FreeList(num_msg_buffers))
+  val rx_msg_ids = for (id <- 0 until NUM_MSG_BUFFERS) yield id.U
+  val rx_msg_id_freelist = Module(new FreeList(rx_msg_ids))
   // table mapping unique msg identifier to rx_msg_id
   // TODO(sibanez): this should eventually turn into a D-left exact-match table
-  val rx_msg_id_table = SyncReadMem(num_msg_buffers, new RxMsgIdTableEntry())
-  // TODO(sibanez): is there a way to move the msg_buffer_ram and size_class_freelists
-  //   into a separate module (e.g. MessageBuffer) so that the implementation is
-  //   usable for both the Reassembly and Packetization modules?
+  val rx_msg_id_table = SyncReadMem(NUM_MSG_BUFFERS, new RxMsgIdTableEntry())
   // RAM used to store msgs while they are being reassembled and delivered to the CPU.
   //   Msgs are stored in words that are the same size as the datapath width.
-  val msg_buffer_ram = SyncReadMem(num_msg_buffer_words, UInt(LNICConsts.NET_DP_WIDTH.W))
+  val msg_buffer_ram = SyncReadMem(NUM_MSG_BUFFER_WORDS, UInt(NET_DP_BITS.W))
   // table mapping {rx_msg_id => received_bitmap}
-  val received_table = SyncReadMem(num_msg_buffers, UInt(LNICConsts.MAX_PKTS_PER_MSG.W))
+  val received_table = SyncReadMem(NUM_MSG_BUFFERS, UInt(MAX_PKTS_PER_MSG.W))
   // table mapping {rx_msg_id => buffer info}
-  val buf_info_table = SyncReadMem(num_msg_buffers, new BufInfoTableEntry(buf_ptr_width))
+  val buf_info_table = SyncReadMem(NUM_MSG_BUFFERS, new BufInfoTableEntry())
+
   // Vector of Regs containing the buffer size of each size class
-  val size_class_buf_sizes = RegInit(Vec(LNICConsts.MSG_BUFFER_COUNT.map( (size: Int, count: Int) => size.U(16.W) )))
+  val size_class_buf_sizes = RegInit(Vec(MSG_BUFFER_COUNT.map( (size: Int, count: Int) => size.U(MSG_LEN_BITS.W) )))
   // Vector of freelists to keep track of available buffers to store msgs.
   //   There is one free list for each size class.
-  var ptr = 0
-  val size_class_freelists = for ((size, count) <- LNICConsts.MSG_BUFFER_COUNT) yield {
-    require(size % LNICConsts.NET_DP_BYTES == 0, "Size of each buffer must be evenly divisible by word size.")
-    // compute the buffer pointers to insert into each free list
-    val buf_ptrs = for (i <- 0 until count) yield {
-        val p = ptr
-        ptr = p + size/LNICConsts.NET_DP_BYTES
-        p.U(buf_ptr_width.W)
-    }
-    val free_list = Module(new FreeList(buf_ptrs))
-    free_list
-  }
-  val size_class_freelists_io = Vec(size_class_freelists.map(_.io))
+  val size_class_freelists_io = make_size_class_freelists()
+
   // FIFO queue to schedule delivery of fully assembled msgs to the CPU
   // TODO(sibanez): this should become a PIFO ideally, or at least per-context queues each with an associated priority
-  val scheduled_msgs_enq = Wire(Decoupled(new MsgDescriptor(buf_ptr_width))
-  val scheduled_msgs_deq = Wire(Flipped(Decoupled(new MsgDescriptor(buf_ptr_width)))
-  scheduled_msgs_deq <> Queue(scheduled_msgs_enq, num_msg_buffers)
+  val scheduled_msgs_enq = Wire(Decoupled(new RxMsgDescriptor))
+  val scheduled_msgs_deq = Wire(Flipped(Decoupled(new RxMsgDescriptor)))
+  scheduled_msgs_deq <> Queue(scheduled_msgs_enq, NUM_MSG_BUFFERS)
 
   /* GetRxMsgInfo State Machine:
    *   - Process getRxMsgInfo() extern function calls
@@ -270,19 +224,19 @@ class LNICAssemble(implicit p: Parameters) extends Module {
 
   val meta_in_bits_reg = Reg(new PISAIngressMetaOut())
 
-  val max_words_per_pkt = LNICConsts.MAX_PKT_LEN_BYTES/LNICConsts.NET_DP_BYTES
+  val max_words_per_pkt = MAX_PKT_LEN_BYTES/NET_DP_BYTES
   require(isPow2(max_words_per_pkt))
 
-  val enq_rx_msg_id = Wire(UInt(LNICConsts.LNIC_MSG_ID_BITS.W))
+  val enq_rx_msg_id = Wire(UInt(LNIC_MSG_ID_BITS.W))
   // buf_info_table read port
   val enq_buf_info_table_port = buf_info_table(enq_rx_msg_id)
   val buf_info = Wire(new BufInfoTableEntry())
   val buf_info_reg = Reg(new BufInfoTableEntry())
   // received_table read/write port
   val enq_received_table_port = received_table(enq_rx_msg_id)
-  val enq_received = Wire(UInt(LNICConsts.MAX_PKTS_PER_MSG.W))
+  val enq_received = Wire(UInt(MAX_PKTS_PER_MSG.W))
   // msg_buffer_ram write port
-  val pkt_word_ptr = Wire(UInt(buf_ptr_width.W))
+  val pkt_word_ptr = Wire(UInt(BUF_PTR_BITS.W))
   val enq_msg_buffer_ram_port = msg_buffer_ram(pkt_word_ptr)
 
   val msg_complete_reg = Reg(Bool())
@@ -343,7 +297,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
             val pkt_ptr = compute_pkt_ptr(buf_info_reg.buf_ptr, meta_in_bits_reg.pkt_offset)
             pkt_word_ptr := pkt_ptr + pkt_word_count
             // Make sure we are not writing beyond the buffer
-            when (pkt_word_count < (buf_info_reg.buf_size >> log2ceil(LNICConsts.NET_DP_BYTES))) {
+            when (pkt_word_count < (buf_info_reg.buf_size >> log2ceil(NET_DP_BYTES))) {
                 enq_msg_buffer_ram_port := io.net_in.bits.data
                 pkt_word_count := pkt_word_count + 1.U
             }
@@ -407,23 +361,23 @@ class LNICAssemble(implicit p: Parameters) extends Module {
   val deq_buf_word_ptr = scheduled_msgs_deq.bits.buf_ptr // default
   val deq_msg_buf_ram_port = msg_buffer_ram(deq_buf_word_ptr)
 
-  val msg_desc_reg = Reg(new MsgDescriptor(buf_ptr_width))
-  val msg_word_count = RegInit(0.U(16.W))
-  val rem_bytes_reg = RegInit(0.U(16.W))
+  val msg_desc_reg = Reg(new RxMsgDescriptor)
+  val msg_word_count = RegInit(0.U(MSG_LEN_BITS.W))
+  val rem_bytes_reg = RegInit(0.U(MSG_LEN_BITS.W))
 
   // 512-bit and 64-bit words from the msg buffer
-  val buf_net_out_wide = Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH))
-  val buf_net_out_narrow = Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH))
+  val buf_net_out_wide = Decoupled(new StreamChannel(NET_DP_BITS))
+  val buf_net_out_narrow = Decoupled(new StreamChannel(XLEN))
 
   // defaults
   // 512-bit => 64-bit
   StreamWidthAdapter(buf_net_out_narrow, // output
                      buf_net_out_wide)   // input
   io.net_out <> buf_net_out_narrow
-  io.net_out.bits.data := reverse_bytes(buf_net_out_narrow.bits.data, LNICConsts.NET_IF_BYTES)
+  io.net_out.bits.data := reverse_bytes(buf_net_out_narrow.bits.data, XBYTES)
 
   buf_net_out_wide.valid := false.B
-  buf_net_out_wide.bits.keep := LNICConsts.NET_DP_FULL_KEEP
+  buf_net_out_wide.bits.keep := NET_DP_FULL_KEEP
   buf_net_out_wide.bits.last := false.B
   scheduled_msgs_deq.ready = false.B
 
@@ -438,7 +392,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
         // Write app_hdr
         io.net_out.valid = true.B
         io.net_out.bits.data := scheduled_msgs_deq.bits.rx_app_hdr.asUInt
-        io.net_out.bits.keep = LNICConsts.NET_IF_FULL_KEEP
+        io.net_out.bits.keep = NET_CPU_FULL_KEEP
         io.net_out.bits.last = false.B
         io.meta_out.bits.dst_context := scheduled_msgs_deq.bits.dst_context
         when (io.net_out.ready) {
@@ -457,16 +411,16 @@ class LNICAssemble(implicit p: Parameters) extends Module {
       buf_net_out_wide.valid := true.B
       // read current buffer word
       buf_net_out_wide.bits.data := deq_msg_buf_ram_port
-      val is_last_word = rem_bytes_reg < LNICConsts.NET_DP_BYTES.U
+      val is_last_word = rem_bytes_reg < NET_DP_BYTES.U
       buf_net_out_wide.bits.keep := Mux(is_last_word,
                                         (1.U << rem_bytes_reg) - 1.U,
-                                        LNICConsts.NET_DP_FULL_KEEP)
+                                        NET_DP_FULL_KEEP)
       buf_net_out_wide.bits.last := is_last_word
       when (buf_net_out_wide.ready) {
         // move to the next word
         deq_buf_word_ptr := msg_desc_reg.buf_ptr + msg_word_count + 1.U
         msg_word_count := msg_word_count + 1.U
-        rem_bytes_reg := rem_bytes_reg - LNICConsts.NET_DP_BYTES.U
+        rem_bytes_reg := rem_bytes_reg - NET_DP_BYTES.U
         when (is_last_word) {
           // state transition
           stateDeq := sScheduleMsg

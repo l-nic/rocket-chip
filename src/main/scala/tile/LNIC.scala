@@ -16,12 +16,18 @@ import freechips.rocketchip.util._
 import scala.collection.mutable.LinkedHashMap
 
 object LNICConsts {
-  val NET_IF_WIDTH = 64
-  val NET_IF_BYTES = NET_IF_WIDTH/8
+  // width of MAC interface
+  val NET_IF_BITS = 64
+  val NET_IF_BYTES = NET_IF_BITS/8
   val NET_LEN_BITS = 16
 
-  val NET_DP_WIDTH = 512
-  val NET_DP_BYTES = NET_DP_WIDTH/8
+  // width of datapath
+  val NET_DP_BITS = 512
+  val NET_DP_BYTES = NET_DP_BITS/8
+
+  // width of CPU register file interface
+  val XLEN = 64
+  val XBYTES = XLEN/8
 
   val ETH_MAX_BYTES = 1520
   val ETH_MIN_BYTES = 64
@@ -39,6 +45,7 @@ object LNICConsts {
 
   def NET_IF_FULL_KEEP = ~0.U(NET_IF_BYTES.W)
   def NET_DP_FULL_KEEP = ~0.U(NET_DP_BYTES.W)
+  def NET_CPU_FULL_KEEP = ~0.U(XBYTES.W)
   def ETH_BCAST_MAC = ~0.U(ETH_MAC_BITS.W)
 
   val LWRITE_ADDR = 31.U
@@ -65,15 +72,21 @@ object LNICConsts {
   val PKT_OFFSET_BITS = 8
   val MSG_LEN_BITS = 16
 
+  // This queue only builds up if pkts are being scheduled faster than
+  // they are being transmitted.
+  val SCHEDULED_PKTS_Q_DEPTH = 256
+
+  // Message buffers for both packetization and reassembly
   // LinkedHashMap[Int, Int] : {buffer_size (bytes) => num_buffers}
   val MSG_BUFFER_COUNT = LinkedHashMap(64  -> 64,
                                        128 -> 32,
                                        256 -> 16,
                                        512 -> 8)
+  val NUM_MSG_BUFFER_WORDS = MSG_BUFFER_COUNT.map( (size: Int, count: Int) => (size/NET_DP_BYTES)*count ).reduce(_ + _)
+  val NUM_MSG_BUFFERS = MSG_BUFFER_COUNT.map( (size: Int, count: Int) => count ).reduce(_ + _)
 
-  // This queue only builds up if pkts are being scheduled faster than
-  // they are being transmitted.
-  val SCHEDULED_PKTS_Q_DEPTH = 256
+  require (isPow2(NUM_MSG_BUFFER_WORDS))
+  require (isPow2(NUM_MSG_BUFFERS))
 }
 
 case class LNICParams(
@@ -85,13 +98,7 @@ case class LNICParams(
   arbiterPktBufFlits:   Int = 2 * LNICConsts.NET_DP_ETH_MAX_FLITS,
   arbiterMetaBufFlits:  Int = 2 * LNICConsts.NET_DP_ETH_MAX_FLITS,
   assemblePktBufFlits:  Int = 2 * LNICConsts.NET_IF_ETH_MAX_FLITS,
-  assembleMetaBufFlits: Int = 2 * LNICConsts.NET_IF_ETH_MAX_FLITS,
-  parserPktBufFlits:    Int = 2 * LNICConsts.NET_DP_ETH_MAX_FLITS,
-  parserMetaBufFlits:   Int = 2 * LNICConsts.NET_DP_ETH_MAX_FLITS,
-  maPktBufFlits:        Int = 2 * LNICConsts.NET_DP_ETH_MAX_FLITS,
-  maMetaBufFlits:       Int = 2 * LNICConsts.NET_DP_ETH_MAX_FLITS,
-  deparserPktBufFlits:  Int = 2 * LNICConsts.NET_DP_ETH_MAX_FLITS,
-  deparserMetaBufFlits: Int = 2 * LNICConsts.NET_DP_ETH_MAX_FLITS
+  assembleMetaBufFlits: Int = 2 * LNICConsts.NET_IF_ETH_MAX_FLITS
 )
 
 case object LNICKey extends Field[LNICParams]
@@ -100,32 +107,30 @@ class NetToCoreMeta extends AssembleMetaOut {
   override def cloneType = new NetToCoreMeta().asInstanceOf[this.type]
 }
 
-class CoreToNetMeta extends LNICTxQueueMetaOut {
-  override def cloneType = new CoreToNetMeta().asInstanceOf[this.type]
-}
-
 /**
  * This is intended to be L-NIC's IO to the core.
  */
-class LNICCoreIO extends StreamIO(LNICConsts.NET_IF_WIDTH) {
-  val meta_in = Flipped(Valid(new CoreToNetMeta))
+class LNICCoreIO extends Bundle {
+  // Msg words from TxQueue
+  val net_in = Flipped(Decoupled(new MsgWord))
+  // Msgs going to RxQueues
+  val net_out = Decoupled(StreamChannel(LNICConsts.XLEN))
   val meta_out = Valid(new NetToCoreMeta)
-  override def cloneType = (new LNICCoreIO).asInstanceOf[this.type]
 }
 
 /**
  * This is intended to be the Core's IO to L-NIC.
  */
-class CoreLNICIO extends StreamIO(LNICConsts.NET_IF_WIDTH) {
+class CoreLNICIO extends Bundle {
+  val net_in = Flipped(Decoupled(StreamChannel(LNICConsts.XLEN)))
   val meta_in = Flipped(Valid(new NetToCoreMeta))
-  val meta_out = Valid(new CoreToNetMeta)
-  override def cloneType = (new CoreLNICIO).asInstanceOf[this.type]
+  val net_out = Decoupled(new MsgWord)
 }
 
 /**
  * This is intended to be the IO to the external network.
  */
-class LNICNetIO extends StreamIO(LNICConsts.NET_IF_WIDTH) {
+class LNICNetIO extends StreamIO(LNICConsts.NET_IF_BITS) {
   override def cloneType = (new LNICNetIO).asInstanceOf[this.type]
 }
 
@@ -154,6 +159,7 @@ class LNICModuleImp(outer: LNIC)(implicit p: Parameters) extends LazyModuleImp(o
   val pisa_ingress = Module(new SDNetIngressWrapper)
   val pisa_egress = Module(new SDNetEgressWrapper)
   val assemble = Module(new LNICAssemble)
+  val packetize = Module(new LNICPacketize)
 
   pisa_ingress.io.clock := clock
   pisa_ingress.io.reset := reset
@@ -161,22 +167,24 @@ class LNICModuleImp(outer: LNIC)(implicit p: Parameters) extends LazyModuleImp(o
   pisa_egress.io.reset := reset
 
   // 64-bit => 512-bit
-  StreamWidthAdapter(pisa_egress.io.net.net_in,
-                     pisa_egress.io.net.meta_in,
-                     io.core.in,
-                     io.core.meta_in)
   StreamWidthAdapter(pisa_ingress.io.net.net_in,
                      io.net.in)
 
+  assemble.io.net_in <> pisa_ingress.io.net.net_out
+  assemble.io.meta_in := pisa_ingress.io.net.meta_out
+
+  io.core.net_out <> assemble.io.net_out
+  io.core.meta_out := assemble.io.meta_out 
+
+  packetize.io.net_in <> io.core.net_in
+
+  pisa_egress.io.net.net_in <> packetize.io.net_out
+  pisa_egress.io.net.meta_in := packetize.io.meta_out
+
   // 512-bit => 64-bit
-  StreamWidthAdapter(assemble.io.net_in,
-                     assemble.io.meta_in,
-                     pisa_ingress.io.net.net_out,
-                     pisa_ingress.io.net.meta_out)
   StreamWidthAdapter(io.net.out,
                      pisa_egress.io.net.net_out)
-  io.core.out <> assemble.io.net_out
-  io.core.meta_out <> assemble.io.meta_out
+
 }
 
 /** An I/O Bundle for LNIC RxQueue.
@@ -319,10 +327,9 @@ trait CanHaveLNICModule { this: RocketTileModuleImp =>
     // Connect network IO to LNIC module
     net.get <> outer.lnic.get.module.io.net
     // Connect LNIC module to RocketCore
-    core.io.net.get.in <> outer.lnic.get.module.io.core.out
+    core.io.net.get.net_in <> outer.lnic.get.module.io.core.net_out
     core.io.net.get.meta_in <> outer.lnic.get.module.io.core.meta_out
-    outer.lnic.get.module.io.core.in <> core.io.net.get.out
-    outer.lnic.get.module.io.core.meta_in <> core.io.net.get.meta_out
+    outer.lnic.get.module.io.core.net_in <> core.io.net.get.net_out
   }
 }
 

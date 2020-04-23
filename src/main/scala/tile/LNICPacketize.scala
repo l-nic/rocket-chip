@@ -18,11 +18,11 @@ import LNICConsts._
 class TxAppHdr extends Bundle {
   val dst_ip = UInt(32.W)
   val dst_context = UInt(LNIC_CONTEXT_BITS.W)
-  val msg_len = UInt(16.W)
+  val msg_len = UInt(MSG_LEN_BITS.W)
 }
 
 /**
- * LNIC Pktization Module
+ * LNIC Packetization Module
  *
  * Tasks:
  *   - Reverse byte order of words coming from CPU
@@ -30,9 +30,9 @@ class TxAppHdr extends Bundle {
  *   - Store msgs and transmit pkts, also support retransmitting pkts when told to do so
  */
 
-class PktizeIO extends Bundle {
+class PacketizeIO extends Bundle {
   val net_in = Flipped(Decoupled(new MsgWord))
-  val net_out = Decoupled(new StreamChannel(NET_DP_WIDTH))
+  val net_out = Decoupled(new StreamChannel(NET_DP_BITS))
   val meta_out = Valid(new PISAEgressMetaIn)
 }
 
@@ -59,50 +59,32 @@ class ContextEnqState extends Bundle {
 }
 
 @chiselName
-class LNICPktize(implicit p: Parameters) extends Module {
+class LNICPacketize(implicit p: Parameters) extends Module {
   val num_contexts = p(LNICKey).maxNumContexts
 
-  val io = IO(new PktizeIO)
-
-  /* TODO(sibanez): consolidate with Msg Assembly module */
-
-  // parameter computations
-  val num_msg_buffer_words = LNICConsts.MSG_BUFFER_COUNT.map( (size: Int, count: Int) => (size/LNICConsts.NET_DP_BYTES)*count ).reduce(_ + _)
-  val num_msg_buffers = LNICConsts.MSG_BUFFER_COUNT.map( (size: Int, count: Int) => count ).reduce(_ + _)
-  val buf_ptr_width = log2ceil(num_msg_buffer_words)
-  require (isPow2(num_msg_buffers))
+  val io = IO(new PacketizeIO)
 
   /* Memories (i.e. tables) and Queues */
   // freelist to keep track of available tx_msg_ids
-  // TODO(sibanez): update FreeList initialization to use Seq[UInt]
-  val tx_msg_id_freelist = Module(new FreeList(num_msg_buffers))
+  val tx_msg_ids = for (id <- 0 until NUM_MSG_BUFFERS) yield id.U
+  val tx_msg_id_freelist = Module(new FreeList(tx_msg_ids))
   // RAM used to store msgs while they are being reassembled and delivered to the CPU.
   //   Msgs are stored in words that are the same size as the datapath width.
-  val msg_buffer_ram = SyncReadMem(num_msg_buffer_words, Vec(LNICConsts.NET_DP_WIDTH/xLen, UInt(xLen.W)))
+  val msg_buffer_ram = SyncReadMem(NUM_MSG_BUFFER_WORDS, Vec(NET_DP_BITS/XLEN, UInt(XLEN.W)))
 
   // Vector of Regs containing the buffer size of each size class
-  val size_class_buf_sizes = RegInit(Vec(LNICConsts.MSG_BUFFER_COUNT.map( (size: Int, count: Int) => size.U(16.W) )))
+  val size_class_buf_sizes = RegInit(Vec(MSG_BUFFER_COUNT.map( (size: Int, count: Int) => size.U(MSG_LEN_BITS.W) )))
   // Vector of freelists to keep track of available buffers to store msgs.
   //   There is one free list for each size class.
-  var ptr = 0
-  val size_class_freelists = for ((size, count) <- LNICConsts.MSG_BUFFER_COUNT) yield {
-    require(size % LNICConsts.NET_DP_BYTES == 0, "Size of each buffer must be evenly divisible by word size.")
-    // compute the buffer pointers to insert into each free list
-    val buf_ptrs = for (i <- 0 until count) yield {
-        val p = ptr
-        ptr = p + size/LNICConsts.NET_DP_BYTES
-        p.U(buf_ptr_width.W)
-    }
-    val free_list = Module(new FreeList(buf_ptrs))
-    free_list
-  }
-  val size_class_freelists_io = Vec(size_class_freelists.map(_.io))
+  val size_class_freelists_io = make_size_class_freelists() 
+
   // FIFO queue to schedule delivery of TX pkts
   // TODO(sibanez): this should become a PIFO ideally
-  val scheduled_pkts_enq = Wire(Decoupled(new TxPktDescriptor(buf_ptr_width))
-  val scheduled_pkts_deq = Wire(Flipped(Decoupled(new TxPktDescriptor(buf_ptr_width)))
+  val scheduled_pkts_enq = Wire(Decoupled(new TxPktDescriptor))
+  val scheduled_pkts_deq = Wire(Flipped(Decoupled(new TxPktDescriptor)))
   scheduled_pkts_deq <> Queue(scheduled_pkts_enq, SCHEDULED_PKTS_Q_DEPTH)
 
+  // TODO(sibanez): I think I need to reverse byte order here?
   /**
    * Msg Enqueue State Machine.
    * Tasks:
@@ -148,11 +130,12 @@ class LNICPktize(implicit p: Parameters) extends Module {
   val context_enq_state = Reg(VecInit(Seq.fill(num_contexts)(new ContextEnqState)))
 
   // msg buffer write port
-  val enq_buf_ptr = Wire(UInt(buf_ptr_width.W))
+  val enq_buf_ptr = Wire(UInt(BUF_PTR_BITS.W))
   val enq_msg_buf_ram_port = msg_buffer_ram(enq_buf_ptr)
 
   switch (enqStates(enq_context)) {
     is (sWaitAppHdr) {
+      // assert back pressure to the CPU if there are no available buffers for this msg
       io.net_in.ready := (available_classes > 0.U)
       when (io.net_in.valid && io.net_in.ready) {
         assert (tx_msg_id_freelist.valid, "There is an available buffer but not an available tx_msg_id?")
@@ -163,16 +146,17 @@ class LNICPktize(implicit p: Parameters) extends Module {
         val target_size_class = PriorityEncoder(available_classes)
         val target_freelist = size_class_freelists_io(target_size_class)
         target_freelist.deq.ready := true.B
-        // record per-context enqueue state
         val buf_ptr = target_freelist.deq.bits
-        context_enq_state(enq_context).tx_app_hdr := tx_app_hdr
-        context_enq_state(enq_context).tx_msg_id := tx_msg_id
-        context_enq_state(enq_context).size_class := target_size_class
-        context_enq_state(enq_context).buf_ptr := buf_ptr
-        context_enq_state(enq_context).pkt_offset := 0.U
-        context_enq_state(enq_context).rem_bytes := tx_app_hdr.msg_len
-        context_enq_state(enq_context).pkt_bytes := 0.U
-        context_enq_state(enq_context).word_count := 0.U // counts the number of words written by CPU for this msg (not including app hdr)
+        // record per-context enqueue state
+        val ctx_state = context_enq_state(enq_context)
+        ctx_state.tx_app_hdr := tx_app_hdr
+        ctx_state.tx_msg_id := tx_msg_id
+        ctx_state.size_class := target_size_class
+        ctx_state.buf_ptr := buf_ptr
+        ctx_state.pkt_offset := 0.U
+        ctx_state.rem_bytes := tx_app_hdr.msg_len
+        ctx_state.pkt_bytes := 0.U
+        ctx_state.word_count := 0.U // counts the number of words written by CPU for this msg (not including app hdr)
         // TODO(sibanez): initialize state that is indexed by tx_msg_id (for transport support)
         // state transition
         enqStates(enq_context) := sWriteMsg
@@ -183,14 +167,14 @@ class LNICPktize(implicit p: Parameters) extends Module {
       when (io.net_in.valid) {
         val ctx_state = context_enq_state(enq_context)
         // compute where to write MsgWord in the buffer
-        val word_offset_bits = log2ceil(LNICConsts.NET_DP_WIDTH/xLen)
+        val word_offset_bits = log2ceil(NET_DP_BITS/XLEN)
         val word_offset = ctx_state.word_count(word_offset_bits-1, 0)
         val word_ptr = ctx_state.word_count(15, word_offset_bits)
         enq_buf_ptr := ctx_state.buf_ptr + word_ptr
         // TODO(sibanez): check that this properly implements a sub-word write
         enq_msg_buf_ram_port(word_offset) := io.net_in.bits.data
         // build tx pkt descriptor just in case we need to schedule a pkt
-        val tx_pkt_desc = Wire(new TxPktDescriptor(buf_ptr_width))
+        val tx_pkt_desc = Wire(new TxPktDescriptor)
         tx_pkt_desc.tx_msg_id := ctx_state.tx_msg_id
         tx_pkt_desc.tx_pkts := 1.U << ctx_state.pkt_offset
         tx_pkt_desc.buf_ptr := ctx_state.buf_ptr
@@ -198,8 +182,8 @@ class LNICPktize(implicit p: Parameters) extends Module {
         tx_pkt_desc.tx_app_hdr := ctx_state.tx_app_hdr
         tx_pkt_desc.src_context := enq_context
 
-        val is_last_word = ctx_state.rem_bytes <= (xLen/8).U
-        val is_full_pkt = ctx_state.pkt_bytes + (xLen/8).U === LNICConsts.MAX_PKT_LEN_BYTES
+        val is_last_word = ctx_state.rem_bytes <= XBYTES.U
+        val is_full_pkt = ctx_state.pkt_bytes + XBYTES.U === MAX_PKT_LEN_BYTES.U
 
         when (is_last_word || is_full_pkt) {
           // schedule pkt for tx
@@ -221,7 +205,7 @@ class LNICPktize(implicit p: Parameters) extends Module {
         }
 
         // update context state variables
-        ctx_state.rem_bytes := ctx_state.rem_bytes - (xLen/8).U
+        ctx_state.rem_bytes := ctx_state.rem_bytes - XBYTES.U
         ctx_state.word_count := ctx_state.word_count + 1.U
       }
     }
@@ -254,24 +238,32 @@ class LNICPktize(implicit p: Parameters) extends Module {
   // msg buffer read port
   val deq_buf_ptr = Wire(UInt(buf_ptr_width.W))
   val deq_msg_buf_ram_port = msg_buffer_ram(deq_buf_ptr)
-  val deq_buf_ptr_reg = RegInit(0.U(buf_ptr_width.W))
+  val deq_buf_ptr_reg = RegInit(0.U(BUF_PTR_BITS.W))
 
   // register to store descriptor of pkt(s) currently being transmitted
-  val active_tx_desc_reg = Reg(new TxPktDescriptor(buf_ptr_width))
+  val active_tx_desc_reg = Reg(new TxPktDescriptor)
   // register to track the number of bytes remaining to send for the current pkt
   val deq_pkt_rem_bytes_reg = RegInit(0.U(16.W))
   // register to track current pkt offset
-  val deq_pkt_offset_reg = RegInit(0.U(16.W))
+  val deq_pkt_offset_reg = RegInit(0.U(PKT_OFFSET_BITS.W))
   // register to track first word of each pkt (used to drive meta_out.valid)
   val is_first_word_reg = RegInit(false.B)
 
   // defaults
-  io.net_out.valid := false.B
+  io.net_out.valid     := false.B
   io.net_out.bits.data := deq_msg_buf_ram_port.asUInt
-  io.net_out.bits.keep := LNICConsts.NET_DP_FULL_KEEP
+  io.net_out.bits.keep := NET_DP_FULL_KEEP
   io.net_out.bits.last := false.B
 
-  io.meta_out.valid = false.B
+  io.meta_out.valid               := is_first_word_reg
+  io.meta_out.bits.dst_ip         := active_tx_desc_reg.tx_app_hdr.dst_ip
+  io.meta_out.bits.dst_context    := active_tx_desc_reg.tx_app_hdr.dst_context
+  io.meta_out.bits.msg_len        := active_tx_desc_reg.tx_app_hdr.msg_len
+  io.meta_out.bits.pkt_offset     := deq_pkt_offset_reg
+  io.meta_out.bits.src_context    := active_tx_desc_reg.src_context
+  io.meta_out.bits.tx_msg_id      := active_tx_desc_reg.tx_msg_id
+  io.meta_out.bits.buf_ptr        := active_tx_desc_reg.buf_ptr
+  io.meta_out.bits.buf_size_class := active_tx_desc_reg.size_class
 
   switch (deqState) {
     is (sWaitTxPkts) {
@@ -287,20 +279,11 @@ class LNICPktize(implicit p: Parameters) extends Module {
     }
     is (sSendTxPkts) {
       io.net_out.valid := true.B
-      val is_last_word = deq_pkt_rem_bytes_reg <= LNICConsts.NET_DP_BYTES.U
+      val is_last_word = deq_pkt_rem_bytes_reg <= NET_DP_BYTES.U
       io.net_out.data.keep := Mux(is_last_word,
                                   (1.U << deq_pkt_rem_bytes_reg) - 1.U,
-                                  LNICConsts.NET_DP_FULL_KEEP)
+                                  NET_DP_FULL_KEEP)
       io.net_out.data.last := is_last_word
-      io.meta_out.valid := is_first_word_reg
-      io.meta_out.bits.dst_ip := active_tx_desc_reg.tx_app_hdr.dst_ip
-      io.meta_out.bits.dst_context := active_tx_desc_reg.tx_app_hdr.dst_context
-      io.meta_out.bits.msg_len := active_tx_desc_reg.tx_app_hdr.msg_len
-      io.meta_out.bits.pkt_offset := deq_pkt_offset_reg
-      io.meta_out.bits.src_context := active_tx_desc_reg.src_context
-      io.meta_out.bits.tx_msg_id := active_tx_desc_reg.tx_msg_id
-      io.meta_out.bits.buf_ptr := active_tx_desc_reg.buf_ptr
-      io.meta_out.bits.buf_size_class := active_tx_desc_reg.size_class
 
       // wait for no backpressure
       when (io.net_out.ready) {
@@ -317,7 +300,7 @@ class LNICPktize(implicit p: Parameters) extends Module {
           deq_buf_ptr := deq_buf_ptr_reg + 1.U
           deq_buf_ptr_reg := deq_buf_ptr
           // update deq_pkt_rem_bytes_reg
-          deq_pkt_rem_bytes_reg := deq_pkt_rem_bytes_reg - LNICConsts.NET_DP_BYTES.U
+          deq_pkt_rem_bytes_reg := deq_pkt_rem_bytes_reg - NET_DP_BYTES.U
           // no longer the first word
           is_first_word_reg := false.B
         }
@@ -330,8 +313,8 @@ class LNICPktize(implicit p: Parameters) extends Module {
     val pkt_offset = PriorityEncoder(descriptor.tx_pkts)
     deq_pkt_offset_reg := pkt_offset
     // find the word offset from the buf_ptr: pkt_offset*words_per_mtu
-    require(isPow2(LNICConsts.MAX_PKT_LEN_BYTES), "MAX_PKT_LEN_BYTES must be a power of 2!")
-    val word_offset = pkt_offset << (log2ceil(LNICConsts.MAX_PKT_LEN_BYTES/LNICConsts.NET_DP_BYTES)).U
+    require(isPow2(MAX_PKT_LEN_BYTES), "MAX_PKT_LEN_BYTES must be a power of 2!")
+    val word_offset = pkt_offset << (log2ceil(MAX_PKT_LEN_BYTES/NET_DP_BYTES)).U
     // start reading the first word of the first pkt
     deq_buf_ptr := descriptor.buf_ptr + word_offset
     deq_buf_ptr_reg := deq_buf_ptr
@@ -346,14 +329,14 @@ class LNICPktize(implicit p: Parameters) extends Module {
     when (pkt_offset === num_pkts - 1.U) {
         // this is the last pkt of the msg
         // compute the number of bytes in the last pkt of the msg
-        val msg_len_mod_mtu = descriptor.msg_len(log2ceil(LNICConsts.MAX_PKT_LEN_BYTES)-1, 0) 
+        val msg_len_mod_mtu = descriptor.msg_len(log2ceil(MAX_PKT_LEN_BYTES)-1, 0) 
         val final_pkt_bytes = Mux(msg_len_mod_mtu === 0.U,
-                                  LNICConsts.MAX_PKT_LEN_BYTES.U,
+                                  MAX_PKT_LEN_BYTES.U,
                                   msg_len_mod_mtu)
         deq_pkt_rem_bytes_reg := final_pkt_bytes
     } .otherwise {
         // this is not the last pkt of the msg
-        deq_pkt_rem_bytes_reg := LNICConsts.MAX_PKT_LEN_BYTES.U
+        deq_pkt_rem_bytes_reg := MAX_PKT_LEN_BYTES.U
     }
   }
 

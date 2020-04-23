@@ -3,12 +3,40 @@ package freechips.rocketchip.tile
 
 import Chisel._
 import chisel3.{chiselTypeOf}
+import LNICConsts._
 
 object NetworkHelpers {
   def reverse_bytes(a: UInt, n: Int) = {
     val bytes = (0 until n).map(i => a((i + 1) * 8 - 1, i * 8))
     Cat(bytes)
   }
+}
+
+def compute_num_pkts(msg_len: UInt) = {
+  require(isPow2(MAX_PKT_LEN_BYTES))
+  // check if msg_len is divisible by MAX_PKT_LEN_BYTES
+  val num_pkts = Mux(msg_len(log2ceil(MAX_PKT_LEN_BYTES)-1, 0) === 0.U,
+                     msg_len >> log2ceil(MAX_PKT_LEN_BYTES).U,
+                     msg_len >> log2ceil(MAX_PKT_LEN_BYTES).U + 1.U)
+  num_pkts
+}
+
+def make_size_class_freelists() = {
+  // Vector of freelists to keep track of available buffers to store msgs.
+  //   There is one free list for each size class.
+  var ptr = 0
+  val size_class_freelists = for ((size, count) <- MSG_BUFFER_COUNT) yield {
+    require(size % NET_DP_BYTES == 0, "Size of each buffer must be evenly divisible by word size.")
+    // compute the buffer pointers to insert into each free list
+    val buf_ptrs = for (i <- 0 until count) yield {
+        val p = ptr
+        ptr = p + size/NET_DP_BYTES
+        p.U(BUF_PTR_BITS.W)
+    }
+    val free_list = Module(new FreeList(buf_ptrs))
+    free_list
+  }
+  Vec(size_class_freelists.map(_.io))
 }
 
 /**

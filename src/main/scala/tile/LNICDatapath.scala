@@ -12,6 +12,7 @@ import freechips.rocketchip.rocket._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util._
 import NetworkHelpers._
+import LNICConsts._
 
 /* LNIC TX Queue:
  * Lives in the Rocket Core CSR File.
@@ -20,18 +21,18 @@ import NetworkHelpers._
  *   - Store and schedule msg words for delivery to the LNIC
  */
 class LNICTxQueueIO extends Bundle {
-  val net_in = Flipped(Valid(UInt(width = 64))) // words written from the CPU
+  val net_in = Flipped(Valid(UInt(XLEN.W))) // words written from the CPU
   val net_out = Decoupled(new MsgWord)
 
-  val cur_context = Input(UInt(width = LNICConsts.LNIC_CONTEXT_BITS))
+  val cur_context = Input(UInt(width = LNIC_CONTEXT_BITS))
   // TODO(sibanez): no need to insert/remove contexts for now
   // val insert = Input(Bool())
   // val remove = Input(Bool())
 }
 
 class MsgWord extends Bundle {
-  val data = UInt(LNICConsts.NET_IF_WIDTH.W)
-  val src_context = UInt(LNICConsts.LNIC_CONTEXT_BITS.W)
+  val data = UInt(XLEN.W)
+  val src_context = UInt(LNIC_CONTEXT_BITS.W)
 }
 
 @chiselName
@@ -41,7 +42,7 @@ class LNICTxQueue(implicit p: Parameters) extends Module {
   val io = IO(new LNICTxQueueIO)
 
   // find max msg buffer size (in terms of 8B words) 
-  val max_msg_words = LNICConsts.MSG_BUFFER_COUNT.map( (size: Int, count: Int) => size/LNICConsts.NET_IF_BYTES ).reduce(max(_,_))
+  val max_msg_words = MSG_BUFFER_COUNT.map( (size: Int, count: Int) => size/XBYTES ).max
 
   val tx_queue_enq = Wire(Decoupled(new MsgWord))
   io.net_out <> Queue(tx_queue_enq, max_msg_words*2)
@@ -53,7 +54,7 @@ class LNICTxQueue(implicit p: Parameters) extends Module {
   // need one state per context
   val enqStates = RegInit(VecInit(Seq.fill(num_contexts)(sStartEnq)))
 
-  val rem_bytes_reg = RegInit(VecInit(Seq.fill(num_contexts)(0.U(16.W))))
+  val rem_bytes_reg = RegInit(VecInit(Seq.fill(num_contexts)(0.U(MSG_LEN_BITS.W))))
 
   // defaults
   tx_queue_enq.valid := io.net_in.valid
@@ -76,12 +77,12 @@ class LNICTxQueue(implicit p: Parameters) extends Module {
     is (sFinishEnq) {
       when (io.net_in.valid) {
         assert (tx_queue_enq.ready, "tx_queue is full during enqueue!")
-        when (rem_bytes_reg(io.cur_context) <= LNICConsts.NET_IF_BYTES.U) {
+        when (rem_bytes_reg(io.cur_context) <= XBYTES.U) {
           // last word
           enqStates(io.cur_context) := sStartEnq
         }
         // update remaining bytes for the msg
-        rem_bytes_reg(io.cur_context) := rem_bytes_reg(io.cur_context) - LNICConsts.NET_IF_BYTES.U
+        rem_bytes_reg(io.cur_context) := rem_bytes_reg(io.cur_context) - XBYTES.U
       }
     }
   }
@@ -89,142 +90,142 @@ class LNICTxQueue(implicit p: Parameters) extends Module {
 }
 
 
-/**
- * LNIC Arbiter classes
- * TODO(sibanez): repurpose this module to schedule between control and data
- *   pkts on the TX path.
- */
-class ArbiterIO extends Bundle {
-  val core_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH)))
-  val core_meta_in = Flipped(Valid(new PktizeMetaOut))
-  val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH)))
-  val net_out = Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH))
-  val meta_out = Valid(new PISAMetaIO)
-
-  override def cloneType = new ArbiterIO().asInstanceOf[this.type]
-}
-
-@chiselName
-class LNICArbiter(implicit p: Parameters) extends Module {
-  val io = IO(new ArbiterIO)
-
-  val pktQueue_in = Wire(Decoupled(new StreamChannel(LNICConsts.NET_DP_WIDTH)))
-  val metaQueue_in = Wire(Decoupled(new PISAMetaIO))
-  val metaQueue_out = Wire(Flipped(Decoupled(new PISAMetaIO)))
-
-  // Set up output queues
-  io.net_out <> Queue(pktQueue_in, p(LNICKey).arbiterPktBufFlits)
-  metaQueue_out <> Queue(metaQueue_in, p(LNICKey).arbiterMetaBufFlits)
-
-  // state machine to arbitrate between core_in and net_in
-  // TODO(sibanez): Eventually, I want this arbiter to drain the core_in @ up to line rate,
-  //   which will prevent pkt drops further down the pipeline.
-  //   The remaining bandwidth will be used to serve net_in.
-  //   The datapath width should increase to 128 bits so both inputs can be served at line rate.
-
-  val sInSelect :: sInWaitEnd :: Nil = Enum(2)
-  val inState = RegInit(sInSelect)
-
-  val reg_selected = RegInit(false.B) // true = CPU, false = network
-
-  // default pktQueue_in
-  pktQueue_in.valid := false.B
-  pktQueue_in.bits := io.net_in.bits
-
-  metaQueue_in.valid := false.B
-  // defaults - used for pkts from network
-  metaQueue_in.bits.ingress_id := false.B
-  metaQueue_in.bits.msg_id := 0.U
-  metaQueue_in.bits.offset := 0.U
-  metaQueue_in.bits.lnic_src := 0.U
-  // initialize unused metadata fields (driven by PISA module)
-  metaQueue_in.bits.egress_id := 0.U;
-  metaQueue_in.bits.lnic_dst := 0.U;
-  metaQueue_in.bits.msg_len := 0.U;
-
-  io.core_in.ready := false.B
-  io.net_in.ready := false.B
-
-  def selectCore() = {
-    reg_selected := true.B
-    pktQueue_in <> io.core_in
-    metaQueue_in.valid := true.B
-    metaQueue_in.bits.ingress_id := true.B
-    metaQueue_in.bits.msg_id := io.core_meta_in.bits.msg_id
-    metaQueue_in.bits.offset := io.core_meta_in.bits.offset
-    metaQueue_in.bits.lnic_src := io.core_meta_in.bits.lnic_src
-    when (pktQueue_in.valid && pktQueue_in.ready && pktQueue_in.bits.last) {
-      inState := sInSelect // stay in same state
-    } .otherwise {
-      inState := sInWaitEnd
-    }
-  }
-
-  def selectNet() = {
-    reg_selected := false.B
-    pktQueue_in <> io.net_in
-    metaQueue_in.valid := true.B
-    when (pktQueue_in.valid && pktQueue_in.ready && pktQueue_in.bits.last) {
-      inState := sInSelect // stay in same state
-    } .otherwise {
-      inState := sInWaitEnd
-    }
-  }
-
-  switch (inState) {
-    is (sInSelect) {
-      // select which input to read from
-      // write to metaQueue and potentially pktQueue as well
-      when (reg_selected && io.net_in.valid) {
-        // selected CPU last time and net_in is valid
-        selectNet()
-      } .elsewhen (!reg_selected && io.core_in.valid) {
-        // selected network last time and core_in is valid
-        selectCore()
-      } .elsewhen (reg_selected && io.core_in.valid) {
-        // selected CPU last time and core_in is valid
-        selectCore()
-      } .elsewhen (!reg_selected && io.net_in.valid) {
-        // selected network last time and net_in is valid
-        selectNet()
-      }
-    }
-    is (sInWaitEnd) {
-      when (reg_selected) {
-        // CPU input selected
-        pktQueue_in <> io.core_in
-      } .otherwise {
-        // network input selected
-        pktQueue_in <> io.net_in
-      }
-      // wait until end of selected pkt then transition back to sSelect
-      when (pktQueue_in.valid && pktQueue_in.ready && pktQueue_in.bits.last) {
-        inState := sInSelect
-      }
-    }
-  }
-
-  // state machine to drive metaQueue_out.ready
-  val sOutWordOne :: sOutWaitEnd :: Nil = Enum(2)
-  val outState = RegInit(sOutWordOne)
-
-  // only read metaQueue when first word is transferred to PISA pipeline
-  metaQueue_out.ready := (outState === sOutWordOne) && (io.net_out.valid && io.net_out.ready)
-  io.meta_out <> metaQueue_out
-
-  switch (outState) {
-    is (sOutWordOne) {
-      when (io.net_out.valid && io.net_out.ready && !io.net_out.bits.last) {
-        outState := sOutWaitEnd
-      }
-    }
-    is (sOutWaitEnd) {
-      when (io.net_out.valid && io.net_out.ready && io.net_out.bits.last) {
-        outState := sOutWordOne
-      }
-    }
-  }
-}
+// /**
+//  * LNIC Arbiter classes
+//  * TODO(sibanez): repurpose this module to schedule between control and data
+//  *   pkts on the TX path.
+//  */
+// class ArbiterIO extends Bundle {
+//   val core_in = Flipped(Decoupled(new StreamChannel(NET_DP_BITS)))
+//   val core_meta_in = Flipped(Valid(new PktizeMetaOut))
+//   val net_in = Flipped(Decoupled(new StreamChannel(NET_DP_BITS)))
+//   val net_out = Decoupled(new StreamChannel(NET_DP_BITS))
+//   val meta_out = Valid(new PISAMetaIO)
+// 
+//   override def cloneType = new ArbiterIO().asInstanceOf[this.type]
+// }
+// 
+// @chiselName
+// class LNICArbiter(implicit p: Parameters) extends Module {
+//   val io = IO(new ArbiterIO)
+// 
+//   val pktQueue_in = Wire(Decoupled(new StreamChannel(NET_DP_BITS)))
+//   val metaQueue_in = Wire(Decoupled(new PISAMetaIO))
+//   val metaQueue_out = Wire(Flipped(Decoupled(new PISAMetaIO)))
+// 
+//   // Set up output queues
+//   io.net_out <> Queue(pktQueue_in, p(LNICKey).arbiterPktBufFlits)
+//   metaQueue_out <> Queue(metaQueue_in, p(LNICKey).arbiterMetaBufFlits)
+// 
+//   // state machine to arbitrate between core_in and net_in
+//   // TODO(sibanez): Eventually, I want this arbiter to drain the core_in @ up to line rate,
+//   //   which will prevent pkt drops further down the pipeline.
+//   //   The remaining bandwidth will be used to serve net_in.
+//   //   The datapath width should increase to 128 bits so both inputs can be served at line rate.
+// 
+//   val sInSelect :: sInWaitEnd :: Nil = Enum(2)
+//   val inState = RegInit(sInSelect)
+// 
+//   val reg_selected = RegInit(false.B) // true = CPU, false = network
+// 
+//   // default pktQueue_in
+//   pktQueue_in.valid := false.B
+//   pktQueue_in.bits := io.net_in.bits
+// 
+//   metaQueue_in.valid := false.B
+//   // defaults - used for pkts from network
+//   metaQueue_in.bits.ingress_id := false.B
+//   metaQueue_in.bits.msg_id := 0.U
+//   metaQueue_in.bits.offset := 0.U
+//   metaQueue_in.bits.lnic_src := 0.U
+//   // initialize unused metadata fields (driven by PISA module)
+//   metaQueue_in.bits.egress_id := 0.U;
+//   metaQueue_in.bits.lnic_dst := 0.U;
+//   metaQueue_in.bits.msg_len := 0.U;
+// 
+//   io.core_in.ready := false.B
+//   io.net_in.ready := false.B
+// 
+//   def selectCore() = {
+//     reg_selected := true.B
+//     pktQueue_in <> io.core_in
+//     metaQueue_in.valid := true.B
+//     metaQueue_in.bits.ingress_id := true.B
+//     metaQueue_in.bits.msg_id := io.core_meta_in.bits.msg_id
+//     metaQueue_in.bits.offset := io.core_meta_in.bits.offset
+//     metaQueue_in.bits.lnic_src := io.core_meta_in.bits.lnic_src
+//     when (pktQueue_in.valid && pktQueue_in.ready && pktQueue_in.bits.last) {
+//       inState := sInSelect // stay in same state
+//     } .otherwise {
+//       inState := sInWaitEnd
+//     }
+//   }
+// 
+//   def selectNet() = {
+//     reg_selected := false.B
+//     pktQueue_in <> io.net_in
+//     metaQueue_in.valid := true.B
+//     when (pktQueue_in.valid && pktQueue_in.ready && pktQueue_in.bits.last) {
+//       inState := sInSelect // stay in same state
+//     } .otherwise {
+//       inState := sInWaitEnd
+//     }
+//   }
+// 
+//   switch (inState) {
+//     is (sInSelect) {
+//       // select which input to read from
+//       // write to metaQueue and potentially pktQueue as well
+//       when (reg_selected && io.net_in.valid) {
+//         // selected CPU last time and net_in is valid
+//         selectNet()
+//       } .elsewhen (!reg_selected && io.core_in.valid) {
+//         // selected network last time and core_in is valid
+//         selectCore()
+//       } .elsewhen (reg_selected && io.core_in.valid) {
+//         // selected CPU last time and core_in is valid
+//         selectCore()
+//       } .elsewhen (!reg_selected && io.net_in.valid) {
+//         // selected network last time and net_in is valid
+//         selectNet()
+//       }
+//     }
+//     is (sInWaitEnd) {
+//       when (reg_selected) {
+//         // CPU input selected
+//         pktQueue_in <> io.core_in
+//       } .otherwise {
+//         // network input selected
+//         pktQueue_in <> io.net_in
+//       }
+//       // wait until end of selected pkt then transition back to sSelect
+//       when (pktQueue_in.valid && pktQueue_in.ready && pktQueue_in.bits.last) {
+//         inState := sInSelect
+//       }
+//     }
+//   }
+// 
+//   // state machine to drive metaQueue_out.ready
+//   val sOutWordOne :: sOutWaitEnd :: Nil = Enum(2)
+//   val outState = RegInit(sOutWordOne)
+// 
+//   // only read metaQueue when first word is transferred to PISA pipeline
+//   metaQueue_out.ready := (outState === sOutWordOne) && (io.net_out.valid && io.net_out.ready)
+//   io.meta_out <> metaQueue_out
+// 
+//   switch (outState) {
+//     is (sOutWordOne) {
+//       when (io.net_out.valid && io.net_out.ready && !io.net_out.bits.last) {
+//         outState := sOutWaitEnd
+//       }
+//     }
+//     is (sOutWaitEnd) {
+//       when (io.net_out.valid && io.net_out.ready && io.net_out.bits.last) {
+//         outState := sOutWordOne
+//       }
+//     }
+//   }
+// }
 
 /**
  * LNIC Per-Context FIFO queues and interrupt generation.
@@ -242,18 +243,18 @@ class LNICArbiter(implicit p: Parameters) extends Module {
  *   - Insert / remove the current context when told to do so
  */
 class LNICRxQueuesIO(val entries: Int) extends Bundle {
-  val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.NET_IF_WIDTH)))
+  val net_in = Flipped(Decoupled(new StreamChannel(XLEN)))
   val meta_in = Flipped(Valid(new NetToCoreMeta))
-  val net_out = Decoupled(UInt(width = 64)) // words to the CPU
+  val net_out = Decoupled(UInt(width = XLEN)) // words to the CPU
 
-  val cur_context = Input(UInt(width = LNICConsts.LNIC_CONTEXT_BITS))
-  val cur_priority = Input(UInt(width = LNICConsts.LNIC_PRIORITY_BITS))
+  val cur_context = Input(UInt(width = LNIC_CONTEXT_BITS))
+  val cur_priority = Input(UInt(width = LNIC_PRIORITY_BITS))
   val insert = Input(Bool())
   // val remove = Input(Bool()) // we won't support remove for now since it would involve clearing the FIFO
   val idle = Input(Bool())
 
-  val top_context = Output(UInt(width = LNICConsts.LNIC_CONTEXT_BITS))
-  val top_priority = Output(UInt(width = LNICConsts.LNIC_PRIORITY_BITS))
+  val top_context = Output(UInt(width = LNIC_CONTEXT_BITS))
+  val top_priority = Output(UInt(width = LNIC_PRIORITY_BITS))
   val interrupt = Output(Bool())
 
   // number of words for the current context
@@ -303,7 +304,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
 
   // create regs to store count for each context
   val counts = RegInit(VecInit(Seq.fill(num_contexts)(0.U(log2Ceil(max_qsize + 1).W))))
-  val priorities = RegInit(VecInit(Seq.fill(num_contexts)(0.U(LNICConsts.LNIC_PRIORITY_BITS.W))))
+  val priorities = RegInit(VecInit(Seq.fill(num_contexts)(0.U(LNIC_PRIORITY_BITS.W))))
 
   val cur_index = io.cur_context
   val enq_index = Wire(UInt())
@@ -355,7 +356,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
     val sStart :: sEnqueue :: Nil = Enum(2)
     val enqState = RegInit(sStart)
 
-    val reg_enq_index = RegInit(0.U(LNICConsts.LNIC_CONTEXT_BITS.W))
+    val reg_enq_index = RegInit(0.U(LNIC_CONTEXT_BITS.W))
 
     // assert backpressure if the current context is consuming too much space
     io.net_in.ready := counts(enq_index) < max_qsize.U
@@ -419,8 +420,8 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
 
   // Update top_context and top_priority every time a word is enqueued, dequeued, or there is an unread operation.
 
-  val reg_top_priority = RegInit(0.U(LNICConsts.LNIC_PRIORITY_BITS.W))
-  val reg_top_context = RegInit(0.U(LNICConsts.LNIC_CONTEXT_BITS.W))
+  val reg_top_priority = RegInit(0.U(LNIC_PRIORITY_BITS.W))
+  val reg_top_context = RegInit(0.U(LNIC_CONTEXT_BITS.W))
 
   val reg_do_enq = Reg(next = do_enq)
   val reg_do_deq = Reg(next = do_deq)
@@ -431,7 +432,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   when (reg_do_enq || reg_do_deq || reg_do_unread) {
     // Collect all context IDs (indicies) with count > 0 then select the one with the highest priority
 
-    val context_ids = Wire(Vec(num_contexts, UInt(width = LNICConsts.LNIC_CONTEXT_BITS)))
+    val context_ids = Wire(Vec(num_contexts, UInt(width = LNIC_CONTEXT_BITS)))
     for (i <- 0 until context_ids.size) {
       context_ids(i) := i.U
     }
