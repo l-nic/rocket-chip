@@ -22,8 +22,6 @@ class PISAIngressMetaOut extends Bundle {
   val pkt_offset   = UInt(PKT_OFFSET_BITS.W)
   val dst_context  = UInt(LNIC_CONTEXT_BITS.W)
   val rx_msg_id    = UInt(LNIC_MSG_ID_BITS.W)
-
-  override def cloneType = new PISAIngressMetaIO().asInstanceOf[this.type]
 }
 
 class PISAEgressMetaIn extends Bundle {
@@ -36,8 +34,6 @@ class PISAEgressMetaIn extends Bundle {
   val tx_msg_id      = UInt(LNIC_MSG_ID_BITS.W)
   val buf_ptr        = UInt(BUF_PTR_BITS.W)
   val buf_size_class = UInt(SIZE_CLASS_BITS.W)
-
-  override def cloneType = new PISAEgressMetaIO().asInstanceOf[this.type]
 }
 
 /**
@@ -57,7 +53,7 @@ class LNICPISAIngressIO extends Bundle {
  */
 class LNICPISAEgressIO extends Bundle {
   val net_in = Flipped(Decoupled(new StreamChannel(NET_DP_BITS)))
-  val meta_in = Valid(new PISAEgressMetaIn)
+  val meta_in = Flipped(Valid(new PISAEgressMetaIn))
   val net_out = Decoupled(new StreamChannel(NET_DP_BITS))
 
   override def cloneType = new LNICPISAEgressIO().asInstanceOf[this.type]

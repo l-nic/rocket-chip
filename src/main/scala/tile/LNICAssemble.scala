@@ -4,6 +4,7 @@ package freechips.rocketchip.tile
 import Chisel._
 
 import chisel3.{VecInit}
+import chisel3.SyncReadMem
 import chisel3.experimental._
 import freechips.rocketchip.config._
 import freechips.rocketchip.subsystem._
@@ -60,7 +61,7 @@ class RxAppHdr extends Bundle {
 // It is inserted into the scheduler when the msg is fully reassembled.
 // When the scheduler selects a descriptor the dequeue logic uses
 // the info to deliver the indicated msg to the CPU.
-class RxMsgDescriptor(val buf_ptr_width: Int) extends Bundle {
+class RxMsgDescriptor extends Bundle {
   val rx_msg_id = UInt(LNIC_MSG_ID_BITS.W)
   val size_class = UInt(SIZE_CLASS_BITS.W)
   val buf_ptr = UInt(BUF_PTR_BITS.W)
@@ -88,10 +89,10 @@ class LNICAssemble(implicit p: Parameters) extends Module {
   val buf_info_table = SyncReadMem(NUM_MSG_BUFFERS, new BufInfoTableEntry())
 
   // Vector of Regs containing the buffer size of each size class
-  val size_class_buf_sizes = RegInit(Vec(MSG_BUFFER_COUNT.map( (size: Int, count: Int) => size.U(MSG_LEN_BITS.W) )))
+  val size_class_buf_sizes = RegInit(VecInit(MSG_BUFFER_COUNT.map({ case (size: Int, count: Int) => size.U(MSG_LEN_BITS.W) }).toSeq))
   // Vector of freelists to keep track of available buffers to store msgs.
   //   There is one free list for each size class.
-  val size_class_freelists_io = make_size_class_freelists()
+  val size_class_freelists_io = MsgBufHelpers.make_size_class_freelists()
 
   // FIFO queue to schedule delivery of fully assembled msgs to the CPU
   // TODO(sibanez): this should become a PIFO ideally, or at least per-context queues each with an associated priority
@@ -189,8 +190,8 @@ class LNICAssemble(implicit p: Parameters) extends Module {
         received_table(rx_msg_id) := 0.U
       } .otherwise {
         // This is a new msg and we cannot allocate a buffer and rx_msg_id
-        io.getRxMsgInfo.resp.bits.fail = true.B
-        io.getRxMsgInfo.resp.bits.rx_msg_id = 0.U
+        io.getRxMsgInfo.resp.bits.fail := true.B
+        io.getRxMsgInfo.resp.bits.rx_msg_id := 0.U
       }
     }
   }
@@ -240,7 +241,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
   val enq_msg_buffer_ram_port = msg_buffer_ram(pkt_word_ptr)
 
   val msg_complete_reg = Reg(Bool())
-  val pkt_word_count = RegInit(0.U(log2ceil(max_words_per_pkt).W))
+  val pkt_word_count = RegInit(0.U(log2Up(max_words_per_pkt).W))
 
   // defaults
   io.net_in.ready := true.B
@@ -271,7 +272,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
         val new_enq_received = enq_received | (1.U << io.meta_in.bits.pkt_offset)
         enq_received_table_port := new_enq_received
         // check if the whole msg has been received
-        val num_pkts = compute_num_pkts(io.meta_in.bits.msg_len)
+        val num_pkts = MsgBufHelpers.compute_num_pkts(io.meta_in.bits.msg_len)
         val msg_complete = (new_enq_received === (1.U << num_pkts) - 1.U)
         msg_complete_reg := msg_complete
         // state transition
@@ -297,7 +298,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
             val pkt_ptr = compute_pkt_ptr(buf_info_reg.buf_ptr, meta_in_bits_reg.pkt_offset)
             pkt_word_ptr := pkt_ptr + pkt_word_count
             // Make sure we are not writing beyond the buffer
-            when (pkt_word_count < (buf_info_reg.buf_size >> log2ceil(NET_DP_BYTES))) {
+            when (pkt_word_count < (buf_info_reg.buf_size >> log2Up(NET_DP_BYTES))) {
                 enq_msg_buffer_ram_port := io.net_in.bits.data
                 pkt_word_count := pkt_word_count + 1.U
             }
@@ -320,7 +321,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
   }
 
   def compute_pkt_ptr(buf_ptr: UInt, pkt_offset: UInt) = {
-    val pkt_ptr = buf_ptr + (pkt_offset<<log2ceil(max_words_per_pkt).U)
+    val pkt_ptr = buf_ptr + (pkt_offset<<log2Up(max_words_per_pkt).U)
     pkt_ptr
   }
 
@@ -361,13 +362,13 @@ class LNICAssemble(implicit p: Parameters) extends Module {
   val deq_buf_word_ptr = scheduled_msgs_deq.bits.buf_ptr // default
   val deq_msg_buf_ram_port = msg_buffer_ram(deq_buf_word_ptr)
 
-  val msg_desc_reg = Reg(new RxMsgDescriptor)
+  val msg_desc_reg = RegInit((new RxMsgDescriptor).fromBits(0.U))
   val msg_word_count = RegInit(0.U(MSG_LEN_BITS.W))
   val rem_bytes_reg = RegInit(0.U(MSG_LEN_BITS.W))
 
   // 512-bit and 64-bit words from the msg buffer
-  val buf_net_out_wide = Decoupled(new StreamChannel(NET_DP_BITS))
-  val buf_net_out_narrow = Decoupled(new StreamChannel(XLEN))
+  val buf_net_out_wide = Wire(Decoupled(new StreamChannel(NET_DP_BITS)))
+  val buf_net_out_narrow = Wire(Decoupled(new StreamChannel(XLEN)))
 
   // defaults
   // 512-bit => 64-bit
@@ -379,7 +380,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
   buf_net_out_wide.valid := false.B
   buf_net_out_wide.bits.keep := NET_DP_FULL_KEEP
   buf_net_out_wide.bits.last := false.B
-  scheduled_msgs_deq.ready = false.B
+  scheduled_msgs_deq.ready := false.B
 
   // NOTE: This dst_context metadata field is used by the RxQueues Module to drive io.net_out.ready
   io.meta_out.valid := true.B
@@ -390,14 +391,14 @@ class LNICAssemble(implicit p: Parameters) extends Module {
       // Wait for a msg descriptor to be scheduled
       when (scheduled_msgs_deq.valid) {
         // Write app_hdr
-        io.net_out.valid = true.B
+        io.net_out.valid := true.B
         io.net_out.bits.data := scheduled_msgs_deq.bits.rx_app_hdr.asUInt
-        io.net_out.bits.keep = NET_CPU_FULL_KEEP
-        io.net_out.bits.last = false.B
+        io.net_out.bits.keep := NET_CPU_FULL_KEEP
+        io.net_out.bits.last := false.B
         io.meta_out.bits.dst_context := scheduled_msgs_deq.bits.dst_context
         when (io.net_out.ready) {
           // read the head scheduled msg
-          scheduled_msgs_deq.ready = true.B
+          scheduled_msgs_deq.ready := true.B
           // init regs
           msg_desc_reg := scheduled_msgs_deq.bits
           msg_word_count := 0.U

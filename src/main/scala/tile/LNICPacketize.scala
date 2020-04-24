@@ -4,6 +4,7 @@ package freechips.rocketchip.tile
 import Chisel._
 
 import chisel3.{VecInit}
+import chisel3.SyncReadMem
 import chisel3.experimental._
 import freechips.rocketchip.config._
 import freechips.rocketchip.subsystem._
@@ -73,10 +74,10 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   val msg_buffer_ram = SyncReadMem(NUM_MSG_BUFFER_WORDS, Vec(NET_DP_BITS/XLEN, UInt(XLEN.W)))
 
   // Vector of Regs containing the buffer size of each size class
-  val size_class_buf_sizes = RegInit(Vec(MSG_BUFFER_COUNT.map( (size: Int, count: Int) => size.U(MSG_LEN_BITS.W) )))
+  val size_class_buf_sizes = RegInit(VecInit(MSG_BUFFER_COUNT.map({ case (size: Int, count: Int) => size.U(MSG_LEN_BITS.W) }).toSeq))
   // Vector of freelists to keep track of available buffers to store msgs.
   //   There is one free list for each size class.
-  val size_class_freelists_io = make_size_class_freelists() 
+  val size_class_freelists_io = MsgBufHelpers.make_size_class_freelists() 
 
   // FIFO queue to schedule delivery of TX pkts
   // TODO(sibanez): this should become a PIFO ideally
@@ -84,7 +85,6 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   val scheduled_pkts_deq = Wire(Flipped(Decoupled(new TxPktDescriptor)))
   scheduled_pkts_deq <> Queue(scheduled_pkts_enq, SCHEDULED_PKTS_Q_DEPTH)
 
-  // TODO(sibanez): I think I need to reverse byte order here?
   /**
    * Msg Enqueue State Machine.
    * Tasks:
@@ -127,7 +127,7 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   val available_classes = free_classes.asUInt & candidate_classes.asUInt
 
   // Per-context enq state
-  val context_enq_state = Reg(VecInit(Seq.fill(num_contexts)(new ContextEnqState)))
+  val context_enq_state = RegInit(VecInit(Seq.fill(num_contexts)((new ContextEnqState).fromBits(0.U))))
 
   // msg buffer write port
   val enq_buf_ptr = Wire(UInt(BUF_PTR_BITS.W))
@@ -138,10 +138,10 @@ class LNICPacketize(implicit p: Parameters) extends Module {
       // assert back pressure to the CPU if there are no available buffers for this msg
       io.net_in.ready := (available_classes > 0.U)
       when (io.net_in.valid && io.net_in.ready) {
-        assert (tx_msg_id_freelist.valid, "There is an available buffer but not an available tx_msg_id?")
+        assert (tx_msg_id_freelist.io.deq.valid, "There is an available buffer but not an available tx_msg_id?")
         // read tx_msg_id_freelist
-        tx_msg_id_freelist.ready := true.B
-        val tx_msg_id = tx_msg_id_freelist.bits
+        tx_msg_id_freelist.io.deq.ready := true.B
+        val tx_msg_id = tx_msg_id_freelist.io.deq.bits
         // read from target size class freelist
         val target_size_class = PriorityEncoder(available_classes)
         val target_freelist = size_class_freelists_io(target_size_class)
@@ -167,12 +167,12 @@ class LNICPacketize(implicit p: Parameters) extends Module {
       when (io.net_in.valid) {
         val ctx_state = context_enq_state(enq_context)
         // compute where to write MsgWord in the buffer
-        val word_offset_bits = log2ceil(NET_DP_BITS/XLEN)
+        val word_offset_bits = log2Up(NET_DP_BITS/XLEN)
         val word_offset = ctx_state.word_count(word_offset_bits-1, 0)
         val word_ptr = ctx_state.word_count(15, word_offset_bits)
         enq_buf_ptr := ctx_state.buf_ptr + word_ptr
         // TODO(sibanez): check that this properly implements a sub-word write
-        enq_msg_buf_ram_port(word_offset) := io.net_in.bits.data
+        enq_msg_buf_ram_port(word_offset) := reverse_bytes(io.net_in.bits.data, XBYTES)
         // build tx pkt descriptor just in case we need to schedule a pkt
         val tx_pkt_desc = Wire(new TxPktDescriptor)
         tx_pkt_desc.tx_msg_id := ctx_state.tx_msg_id
@@ -236,7 +236,7 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   val deqState = RegInit(sWaitTxPkts)
 
   // msg buffer read port
-  val deq_buf_ptr = Wire(UInt(buf_ptr_width.W))
+  val deq_buf_ptr = Wire(UInt(BUF_PTR_BITS.W))
   val deq_msg_buf_ram_port = msg_buffer_ram(deq_buf_ptr)
   val deq_buf_ptr_reg = RegInit(0.U(BUF_PTR_BITS.W))
 
@@ -280,10 +280,10 @@ class LNICPacketize(implicit p: Parameters) extends Module {
     is (sSendTxPkts) {
       io.net_out.valid := true.B
       val is_last_word = deq_pkt_rem_bytes_reg <= NET_DP_BYTES.U
-      io.net_out.data.keep := Mux(is_last_word,
+      io.net_out.bits.keep := Mux(is_last_word,
                                   (1.U << deq_pkt_rem_bytes_reg) - 1.U,
                                   NET_DP_FULL_KEEP)
-      io.net_out.data.last := is_last_word
+      io.net_out.bits.last := is_last_word
 
       // wait for no backpressure
       when (io.net_out.ready) {
@@ -308,28 +308,29 @@ class LNICPacketize(implicit p: Parameters) extends Module {
     }
   }
 
-  def tx_next_pkt(val descriptor: TxPktDescriptor) = {
+  def tx_next_pkt(descriptor: TxPktDescriptor) = {
     // find the next pkt to transmit
     val pkt_offset = PriorityEncoder(descriptor.tx_pkts)
     deq_pkt_offset_reg := pkt_offset
     // find the word offset from the buf_ptr: pkt_offset*words_per_mtu
     require(isPow2(MAX_PKT_LEN_BYTES), "MAX_PKT_LEN_BYTES must be a power of 2!")
-    val word_offset = pkt_offset << (log2ceil(MAX_PKT_LEN_BYTES/NET_DP_BYTES)).U
+    val word_offset = pkt_offset << (log2Up(MAX_PKT_LEN_BYTES/NET_DP_BYTES)).U
     // start reading the first word of the first pkt
     deq_buf_ptr := descriptor.buf_ptr + word_offset
     deq_buf_ptr_reg := deq_buf_ptr
     // register to track first word of each pkt
     is_first_word_reg := true.B
     // record the updated descriptor
-    val new_descriptor = descriptor
+    val new_descriptor = Wire(new TxPktDescriptor)
+    new_descriptor := descriptor
     new_descriptor.tx_pkts := descriptor.tx_pkts ^ (1.U << pkt_offset)
     active_tx_desc_reg := new_descriptor
     // record bytes remaining for the current pkt
-    val num_pkts = compute_num_pkts(descriptor.msg_len)
+    val num_pkts = MsgBufHelpers.compute_num_pkts(descriptor.tx_app_hdr.msg_len)
     when (pkt_offset === num_pkts - 1.U) {
         // this is the last pkt of the msg
         // compute the number of bytes in the last pkt of the msg
-        val msg_len_mod_mtu = descriptor.msg_len(log2ceil(MAX_PKT_LEN_BYTES)-1, 0) 
+        val msg_len_mod_mtu = descriptor.tx_app_hdr.msg_len(log2Up(MAX_PKT_LEN_BYTES)-1, 0) 
         val final_pkt_bytes = Mux(msg_len_mod_mtu === 0.U,
                                   MAX_PKT_LEN_BYTES.U,
                                   msg_len_mod_mtu)

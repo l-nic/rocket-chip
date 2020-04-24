@@ -3,7 +3,7 @@ package freechips.rocketchip.tile
 
 import Chisel._
 
-import chisel3.{VecInit}
+import chisel3.{VecInit, chiselTypeOf}
 import chisel3.experimental._
 import freechips.rocketchip.config._
 import freechips.rocketchip.subsystem._
@@ -42,7 +42,7 @@ class LNICTxQueue(implicit p: Parameters) extends Module {
   val io = IO(new LNICTxQueueIO)
 
   // find max msg buffer size (in terms of 8B words) 
-  val max_msg_words = MSG_BUFFER_COUNT.map( (size: Int, count: Int) => size/XBYTES ).max
+  val max_msg_words = MSG_BUFFER_COUNT.map({ case (size: Int, count: Int) => size/XBYTES }).max
 
   val tx_queue_enq = Wire(Decoupled(new MsgWord))
   io.net_out <> Queue(tx_queue_enq, max_msg_words*2)
@@ -242,7 +242,7 @@ class LNICTxQueue(implicit p: Parameters) extends Module {
  *   - If the current_context_idle signal is asserted and top_context =/= current_context then generate an interrupt
  *   - Insert / remove the current context when told to do so
  */
-class LNICRxQueuesIO(val entries: Int) extends Bundle {
+class LNICRxQueuesIO(val num_entries: Int) extends Bundle {
   val net_in = Flipped(Decoupled(new StreamChannel(XLEN)))
   val meta_in = Flipped(Valid(new NetToCoreMeta))
   val net_out = Decoupled(UInt(width = XLEN)) // words to the CPU
@@ -258,10 +258,31 @@ class LNICRxQueuesIO(val entries: Int) extends Bundle {
   val interrupt = Output(Bool())
 
   // number of words for the current context
-  val count = Output(UInt(log2Ceil(entries + 1).W))
+  val count = Output(UInt(log2Ceil(num_entries + 1).W))
   val unread = Flipped(Valid(UInt(width = 2)))
 
-  override def cloneType = new LNICRxQueuesIO(entries).asInstanceOf[this.type]
+  override def cloneType = new LNICRxQueuesIO(num_entries).asInstanceOf[this.type]
+}
+
+class FIFOWord(val ptrBits: Int) extends Bundle {
+  val word = UInt(width = XLEN)
+  val next = UInt(width = ptrBits)
+
+  override def cloneType = new FIFOWord(ptrBits).asInstanceOf[this.type]
+}
+
+class HeadTableEntry(val ptrBits: Int) extends Bundle {
+  val valid = Bool()
+  val head = UInt(width = ptrBits)
+
+  override def cloneType = new HeadTableEntry(ptrBits).asInstanceOf[this.type]
+}
+
+class TailTableEntry(val ptrBits: Int) extends Bundle {
+  val valid = Bool()
+  val tail = UInt(width = ptrBits)
+
+  override def cloneType = new TailTableEntry(ptrBits).asInstanceOf[this.type]
 }
 
 /**
@@ -276,20 +297,21 @@ class RxHeadTableEntry(ptrBits: Int) extends HeadTableEntry(ptrBits) {
 
 @chiselName
 class LNICRxQueues(implicit p: Parameters) extends Module {
-  val entries = p(LNICKey).rxBufFlits
+  val num_entries = p(LNICKey).rxBufFlits
   val num_contexts = p(LNICKey).maxNumContexts
 
-  val io = IO(new LNICRxQueuesIO(entries))
+  val io = IO(new LNICRxQueuesIO(num_entries))
 
   // divide the buffer space equally amongst contexts
   // NOTE: this may change in the future, but it's easy for now
-  val max_qsize = entries/num_contexts
+  val max_qsize = num_entries/num_contexts
 
-  val ptrBits = log2Ceil(entries)
+  val ptrBits = log2Ceil(num_entries)
   // create memory used to store msg words
-  val ram = Mem(entries, new FIFOWord(ptrBits))
+  val ram = Mem(num_entries, new FIFOWord(ptrBits))
   // create free list for msg words
   // TODO(sibanez): update entries to be a Seq[UInt]
+  val entries = for (i <- 0 until num_entries) yield i.U
   val freelist = Module(new FreeList(entries))
   // create tables for indexing head/tail of FIFOs in the RAM
   // TODO(sibanez): currently just using context_id to directly index the tables.
@@ -371,8 +393,8 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
         }
       }
       is (sEnqueue) {
+        enq_index := reg_enq_index
         when (io.net_in.valid && io.net_in.ready) {
-          enq_index := reg_enq_index
           perform_enq(enq_index)
           when (io.net_in.bits.last) {
             enqState := sStart
@@ -549,13 +571,13 @@ class FreeList(val entries: Seq[UInt]) extends Module {
 
   // create FIFO queue to store pointers
   val queue_in = Wire(Decoupled(chiselTypeOf(entries(0))))
-  val queue_out = Queue(queue_in, entries.size())
+  val queue_out = Queue(queue_in, entries.size)
 
   val sReset :: sIdle :: Nil = Enum(2)
   val state = RegInit(sReset)
 
   val entries_vec = Vec(entries)
-  val index = RegInit(0.U(log2Ceil(entries.size()).W))
+  val index = RegInit(0.U(log2Ceil(entries.size).W))
 
   // default - connect queue to enq/deq interfaces
   queue_in <> io.enq
@@ -573,7 +595,7 @@ class FreeList(val entries: Seq[UInt]) extends Module {
       when (queue_in.ready) {
         index := index + 1.U
       }
-      when (index === (entries.size() - 1).U) {
+      when (index === (entries.size - 1).U) {
         state := sIdle
       }
     }

@@ -370,7 +370,7 @@ class CSRFile(
 
   if (usingLNIC) {
     // Connect rxQueues IO
-    rxQueues.io.net_in <> io.net.get.in
+    rxQueues.io.net_in <> io.net.get.net_in
     rxQueues.io.meta_in <> io.net.get.meta_in
     rxQueue_out.get <> rxQueues.io.net_out
     rxQueues.io.cur_context := reg_lcurcontext.get

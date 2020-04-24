@@ -82,11 +82,12 @@ object LNICConsts {
                                        128 -> 32,
                                        256 -> 16,
                                        512 -> 8)
-  val NUM_MSG_BUFFER_WORDS = MSG_BUFFER_COUNT.map( (size: Int, count: Int) => (size/NET_DP_BYTES)*count ).reduce(_ + _)
-  val NUM_MSG_BUFFERS = MSG_BUFFER_COUNT.map( (size: Int, count: Int) => count ).reduce(_ + _)
+  val NUM_MSG_BUFFER_WORDS = MSG_BUFFER_COUNT.map({ case (size: Int, count: Int) => (size/NET_DP_BYTES)*count }).reduce(_ + _)
+  val NUM_MSG_BUFFERS = MSG_BUFFER_COUNT.map({ case (size: Int, count: Int) => count }).reduce(_ + _)
 
   require (isPow2(NUM_MSG_BUFFER_WORDS))
-  require (isPow2(NUM_MSG_BUFFERS))
+  // NOTE: this is more of a suggestion than a requirement
+  // require (isPow2(NUM_MSG_BUFFERS))
 }
 
 case class LNICParams(
@@ -114,7 +115,7 @@ class LNICCoreIO extends Bundle {
   // Msg words from TxQueue
   val net_in = Flipped(Decoupled(new MsgWord))
   // Msgs going to RxQueues
-  val net_out = Decoupled(StreamChannel(LNICConsts.XLEN))
+  val net_out = Decoupled(new StreamChannel(LNICConsts.XLEN))
   val meta_out = Valid(new NetToCoreMeta)
 }
 
@@ -122,7 +123,7 @@ class LNICCoreIO extends Bundle {
  * This is intended to be the Core's IO to L-NIC.
  */
 class CoreLNICIO extends Bundle {
-  val net_in = Flipped(Decoupled(StreamChannel(LNICConsts.XLEN)))
+  val net_in = Flipped(Decoupled(new StreamChannel(LNICConsts.XLEN)))
   val meta_in = Flipped(Valid(new NetToCoreMeta))
   val net_out = Decoupled(new MsgWord)
 }
