@@ -311,7 +311,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   val ram = Mem(num_entries, new FIFOWord(ptrBits))
   // create free list for msg words
   // TODO(sibanez): update entries to be a Seq[UInt]
-  val entries = for (i <- 0 until num_entries) yield i.U
+  val entries = for (i <- 0 until num_entries) yield i.U(log2Up(num_entries).W)
   val freelist = Module(new FreeList(entries))
   // create tables for indexing head/tail of FIFOs in the RAM
   // TODO(sibanez): currently just using context_id to directly index the tables.

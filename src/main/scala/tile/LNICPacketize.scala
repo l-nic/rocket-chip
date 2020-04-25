@@ -67,7 +67,7 @@ class LNICPacketize(implicit p: Parameters) extends Module {
 
   /* Memories (i.e. tables) and Queues */
   // freelist to keep track of available tx_msg_ids
-  val tx_msg_ids = for (id <- 0 until NUM_MSG_BUFFERS) yield id.U
+  val tx_msg_ids = for (id <- 0 until NUM_MSG_BUFFERS) yield id.U(log2Up(NUM_MSG_BUFFERS).W)
   val tx_msg_id_freelist = Module(new FreeList(tx_msg_ids))
   // RAM used to store msgs while they are being reassembled and delivered to the CPU.
   //   Msgs are stored in words that are the same size as the datapath width.
@@ -116,6 +116,7 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   // defaults
   val enq_context = io.net_in.bits.src_context
   io.net_in.ready := true.B
+  scheduled_pkts_enq.valid := false.B
 
   val tx_app_hdr = Wire((new TxAppHdr).fromBits(io.net_in.bits.data))
 

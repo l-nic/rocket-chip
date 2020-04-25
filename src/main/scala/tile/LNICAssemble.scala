@@ -75,7 +75,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
 
   /* Memories (i.e. tables) and Queues */
   // freelist to keep track of available rx_msg_ids
-  val rx_msg_ids = for (id <- 0 until NUM_MSG_BUFFERS) yield id.U
+  val rx_msg_ids = for (id <- 0 until NUM_MSG_BUFFERS) yield id.U(log2Up(NUM_MSG_BUFFERS).W)
   val rx_msg_id_freelist = Module(new FreeList(rx_msg_ids))
   // table mapping unique msg identifier to rx_msg_id
   // TODO(sibanez): this should eventually turn into a D-left exact-match table
@@ -246,6 +246,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
   // defaults
   io.net_in.ready := true.B
   enq_rx_msg_id := io.meta_in.bits.rx_msg_id
+  scheduled_msgs_enq.valid := false.B
 
   switch (stateEnq) {
     is (sEnqStart) {

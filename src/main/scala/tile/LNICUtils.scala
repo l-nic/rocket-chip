@@ -35,6 +35,9 @@ object MsgBufHelpers {
           p.U(BUF_PTR_BITS.W)
       }
       val free_list = Module(new FreeList(buf_ptrs))
+      // default wiring
+      free_list.io.enq.valid := false.B
+      free_list.io.deq.ready := false.B
       free_list
     }
     VecInit(size_class_freelists.map(_.io).toSeq)
