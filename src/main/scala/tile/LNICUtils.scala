@@ -35,12 +35,33 @@ object MsgBufHelpers {
           p.U(BUF_PTR_BITS.W)
       }
       val free_list = Module(new FreeList(buf_ptrs))
-      // default wiring
-      free_list.io.enq.valid := false.B
-      free_list.io.deq.ready := false.B
       free_list
     }
     VecInit(size_class_freelists.map(_.io).toSeq)
+  }
+}
+
+object MemHelpers {
+  // Initialize all memory entries with the provided value
+  def memory_init[T <: Data](mem_port: T, wr_addr: UInt, num_entries: Int, reset_val: T) = {
+
+    val sReset :: sIdle :: Nil = Enum(2)
+    val state = RegInit(sReset)
+
+    val index = RegInit(0.U(log2Ceil(num_entries).W))
+
+    switch(state) {
+      is (sReset) {
+        wr_addr := index
+        mem_port := reset_val
+        index := index + 1.U
+        when (index === (num_entries - 1).U) {
+          state := sIdle
+        }
+      }
+      is (sIdle) { }
+    }
+
   }
 }
 

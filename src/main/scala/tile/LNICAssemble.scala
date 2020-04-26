@@ -13,6 +13,7 @@ import freechips.rocketchip.rocket._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util._
 import NetworkHelpers._
+import MemHelpers._
 import LNICConsts._
 
 /**
@@ -28,7 +29,7 @@ class AssembleIO extends Bundle {
   val meta_in = Flipped(Valid(new PISAIngressMetaOut))
   val net_out = Decoupled(new StreamChannel(XLEN))
   val meta_out = Valid(new AssembleMetaOut)
-  val getRxMsgInfo = Flipped(new GetRxMsgInfoIO)
+  val get_rx_msg_info = Flipped(new GetRxMsgInfoIO)
 
   override def cloneType = new AssembleIO().asInstanceOf[this.type]
 }
@@ -100,8 +101,16 @@ class LNICAssemble(implicit p: Parameters) extends Module {
   val scheduled_msgs_deq = Wire(Flipped(Decoupled(new RxMsgDescriptor)))
   scheduled_msgs_deq <> Queue(scheduled_msgs_enq, NUM_MSG_BUFFERS)
 
+  // defaults
+  rx_msg_id_freelist.io.enq.valid := false.B
+  rx_msg_id_freelist.io.deq.ready := false.B
+  size_class_freelists_io.foreach( io => {
+    io.enq.valid := false.B
+    io.deq.ready := false.B
+  })
+
   /* GetRxMsgInfo State Machine:
-   *   - Process getRxMsgInfo() extern function calls
+   *   - Process get_rx_msg_info() extern function calls
    *   - Returns rx_msg_id (or all 1's if failure)
    *   - Initialize rx msg state
    *
@@ -123,14 +132,20 @@ class LNICAssemble(implicit p: Parameters) extends Module {
 
   // register the extern function call request parameters
   // NOTE: this assumes requests will not arrive on back-to-back cycles - TODO: may want to check this assumption
-  val getRxMsgInfo_req_reg = RegNext(io.getRxMsgInfo.req)
+  val get_rx_msg_info_req_reg = RegNext(io.get_rx_msg_info.req)
 
   // TODO(sibanez): update msg_key to include src_ip and src_context,
   //   which requires rx_msg_id_table to become a D-left lookup table.
-  val msg_key = getRxMsgInfo_req_reg.bits.tx_msg_id
+  val msg_key = Wire(UInt())
   val rx_msg_id_table_port = rx_msg_id_table(msg_key)
   val cur_rx_msg_id_table_entry = Wire(new RxMsgIdTableEntry())
-  // TODO(sibanez): add defaults for the above?
+
+  // defaults
+  msg_key := get_rx_msg_info_req_reg.bits.tx_msg_id
+  io.get_rx_msg_info.resp.valid := false.B
+
+  // memory initialization
+  MemHelpers.memory_init(rx_msg_id_table_port, msg_key, NUM_MSG_BUFFERS, (new RxMsgIdTableEntry).fromBits(0.U))
 
   // True if both an rx_msg_id and buffer are available for this msg
   val allocation_success_reg = RegInit(false.B)
@@ -139,14 +154,14 @@ class LNICAssemble(implicit p: Parameters) extends Module {
   // bitmap of valid signals for all size classes
   val free_classes = size_class_freelists_io.map(_.deq.valid)
   // bitmap of size_classes that are large enough to store the whole msg
-  val candidate_classes = size_class_buf_sizes.map(_ >= getRxMsgInfo_req_reg.bits.msg_len)
+  val candidate_classes = size_class_buf_sizes.map(_ >= get_rx_msg_info_req_reg.bits.msg_len)
   // bitmap indicates classes with available buffers that are large enough
   val available_classes = free_classes.asUInt & candidate_classes.asUInt
 
   switch (stateRxMsgInfo) {
     is (sLookupMsg) {
       // wait for a request to arrive
-      when (getRxMsgInfo_req_reg.valid) {
+      when (get_rx_msg_info_req_reg.valid) {
         stateRxMsgInfo := sWriteback
         // read rx_msg_id_table[msg_key] => msg_key is updated on this cycle, result is available on the next one
         // check if there is an available buffer for this msg
@@ -158,18 +173,18 @@ class LNICAssemble(implicit p: Parameters) extends Module {
     is (sWriteback) {
       stateRxMsgInfo := sLookupMsg
       // return extern call response
-      io.getRxMsgInfo.resp.valid := true.B
+      io.get_rx_msg_info.resp.valid := true.B
       // Get result of reading the rx_msg_id_table
       cur_rx_msg_id_table_entry := rx_msg_id_table_port
       when (cur_rx_msg_id_table_entry.valid) {
         // This msg has already been allocated an rx_msg_id
-        io.getRxMsgInfo.resp.bits.fail := false.B
-        io.getRxMsgInfo.resp.bits.rx_msg_id := cur_rx_msg_id_table_entry.rx_msg_id
+        io.get_rx_msg_info.resp.bits.fail := false.B
+        io.get_rx_msg_info.resp.bits.rx_msg_id := cur_rx_msg_id_table_entry.rx_msg_id
       } .elsewhen (allocation_success_reg) {
         // This is a new msg and we can allocate a buffer and rx_msg_id
-        io.getRxMsgInfo.resp.bits.fail := false.B
+        io.get_rx_msg_info.resp.bits.fail := false.B
         val rx_msg_id = rx_msg_id_freelist.io.deq.bits
-        io.getRxMsgInfo.resp.bits.rx_msg_id := rx_msg_id
+        io.get_rx_msg_info.resp.bits.rx_msg_id := rx_msg_id
         // read from rx_msg_id freelist
         assert(rx_msg_id_freelist.io.deq.valid, "There is an available buffer but not an available rx_msg_id?")
         rx_msg_id_freelist.io.deq.ready := true.B
@@ -190,8 +205,8 @@ class LNICAssemble(implicit p: Parameters) extends Module {
         received_table(rx_msg_id) := 0.U
       } .otherwise {
         // This is a new msg and we cannot allocate a buffer and rx_msg_id
-        io.getRxMsgInfo.resp.bits.fail := true.B
-        io.getRxMsgInfo.resp.bits.rx_msg_id := 0.U
+        io.get_rx_msg_info.resp.bits.fail := true.B
+        io.get_rx_msg_info.resp.bits.rx_msg_id := 0.U
       }
     }
   }

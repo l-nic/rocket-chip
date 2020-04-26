@@ -167,6 +167,9 @@ class LNICModuleImp(outer: LNIC)(implicit p: Parameters) extends LazyModuleImp(o
   pisa_egress.io.clock := clock
   pisa_egress.io.reset := reset
 
+  // get_rx_msg_info extern call
+  assemble.io.get_rx_msg_info <> pisa_ingress.io.net.get_rx_msg_info
+
   // 64-bit => 512-bit
   StreamWidthAdapter(pisa_ingress.io.net.net_in,
                      io.net.in)

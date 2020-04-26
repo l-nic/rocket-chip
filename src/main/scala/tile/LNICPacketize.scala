@@ -85,6 +85,14 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   val scheduled_pkts_deq = Wire(Flipped(Decoupled(new TxPktDescriptor)))
   scheduled_pkts_deq <> Queue(scheduled_pkts_enq, SCHEDULED_PKTS_Q_DEPTH)
 
+  // defaults
+  tx_msg_id_freelist.io.enq.valid := false.B
+  tx_msg_id_freelist.io.deq.ready := false.B
+  size_class_freelists_io.foreach( io => {
+    io.enq.valid := false.B
+    io.deq.ready := false.B
+  })
+
   /**
    * Msg Enqueue State Machine.
    * Tasks:
