@@ -282,7 +282,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
         val pkt_ptr = compute_pkt_ptr(buf_info.buf_ptr, io.meta_in.bits.pkt_offset)
         pkt_word_ptr := pkt_ptr
         enq_msg_buffer_ram_port := io.net_in.bits.data
-        pkt_word_count := pkt_word_count + 1.U
+        pkt_word_count := 1.U
         // mark pkt as received
         enq_received := enq_received_table_port
         val new_enq_received = enq_received | (1.U << io.meta_in.bits.pkt_offset)
