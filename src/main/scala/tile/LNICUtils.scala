@@ -18,7 +18,7 @@ object MsgBufHelpers {
     // check if msg_len is divisible by MAX_PKT_LEN_BYTES
     val num_pkts = Mux(msg_len(log2Up(MAX_PKT_LEN_BYTES)-1, 0) === 0.U,
                        msg_len >> log2Up(MAX_PKT_LEN_BYTES).U,
-                       msg_len >> log2Up(MAX_PKT_LEN_BYTES).U + 1.U)
+                       (msg_len >> log2Up(MAX_PKT_LEN_BYTES).U) + 1.U)
     num_pkts
   }
   
@@ -167,7 +167,7 @@ class StreamWidener[T <: Data](inW: Int, outW: Int, metaType: T) extends Module 
   val state = RegInit(s_recv_first)
 
   io.in.ready := (state === s_recv_first) || (state === s_recv_finish)
-  io.out.valid := state === s_send
+  io.out.valid := (state === s_send) && !(reset.toBool)
   io.out.bits.data := data.asUInt
   io.out.bits.keep := keep.asUInt
   io.out.bits.last := last

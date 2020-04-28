@@ -126,7 +126,8 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   io.net_in.ready := true.B
   scheduled_pkts_enq.valid := false.B
 
-  val tx_app_hdr = Wire((new TxAppHdr).fromBits(io.net_in.bits.data))
+  val tx_app_hdr = Wire(new TxAppHdr)
+  tx_app_hdr := (new TxAppHdr).fromBits(io.net_in.bits.data)
 
   // bitmap of valid signals for all size classes
   val free_classes = size_class_freelists_io.map(_.deq.valid)
@@ -287,7 +288,7 @@ class LNICPacketize(implicit p: Parameters) extends Module {
       }
     }
     is (sSendTxPkts) {
-      io.net_out.valid := true.B
+      io.net_out.valid := !(reset.toBool) // do not assert valid on reset
       val is_last_word = deq_pkt_rem_bytes_reg <= NET_DP_BYTES.U
       io.net_out.bits.keep := Mux(is_last_word,
                                   (1.U << deq_pkt_rem_bytes_reg) - 1.U,
