@@ -173,7 +173,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
     is (sWriteback) {
       stateRxMsgInfo := sLookupMsg
       // return extern call response
-      io.get_rx_msg_info.resp.valid := true.B
+      io.get_rx_msg_info.resp.valid := !(reset.toBool)
       // Get result of reading the rx_msg_id_table
       cur_rx_msg_id_table_entry := rx_msg_id_table_port
       when (cur_rx_msg_id_table_entry.valid) {

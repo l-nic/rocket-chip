@@ -80,13 +80,13 @@ object LNICConsts {
   // LinkedHashMap[Int, Int] : {buffer_size (bytes) => num_buffers}
   val MSG_BUFFER_COUNT = LinkedHashMap(64  -> 64,
                                        128 -> 32,
-                                       256 -> 16,
-                                       512 -> 8)
+                                       1024 -> 16,
+                                       4096 -> 8)
   val NUM_MSG_BUFFER_WORDS = MSG_BUFFER_COUNT.map({ case (size: Int, count: Int) => (size/NET_DP_BYTES)*count }).reduce(_ + _)
   val NUM_MSG_BUFFERS = MSG_BUFFER_COUNT.map({ case (size: Int, count: Int) => count }).reduce(_ + _)
 
-  require (isPow2(NUM_MSG_BUFFER_WORDS))
-  // NOTE: this is more of a suggestion than a requirement
+  // NOTE: these are more of a suggestions than requirements
+  // require (isPow2(NUM_MSG_BUFFER_WORDS))
   // require (isPow2(NUM_MSG_BUFFERS))
 }
 

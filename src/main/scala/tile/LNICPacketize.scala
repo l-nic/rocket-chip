@@ -207,6 +207,8 @@ class LNICPacketize(implicit p: Parameters) extends Module {
           // reset/increment pkt counter state
           ctx_state.pkt_offset := ctx_state.pkt_offset + 1.U
           ctx_state.pkt_bytes := 0.U         
+        } .otherwise {
+          ctx_state.pkt_bytes := ctx_state.pkt_bytes + XBYTES.U
         }
 
         when (is_last_word) {
