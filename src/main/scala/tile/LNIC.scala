@@ -71,6 +71,10 @@ object LNICConsts {
   val SIZE_CLASS_BITS = 8
   val PKT_OFFSET_BITS = 8
   val MSG_LEN_BITS = 16
+  // TODO(sibanez): what is the expected range of the credit state?
+  val CREDIT_BITS = 16
+  // TODO(sibanez): define this ...
+  val RTT_PKTS = MAX_PKTS_PER_MSG
 
   // This queue only builds up if pkts are being scheduled faster than
   // they are being transmitted.

@@ -35,6 +35,8 @@ class PacketizeIO extends Bundle {
   val net_in = Flipped(Decoupled(new MsgWord))
   val net_out = Decoupled(new StreamChannel(NET_DP_BITS))
   val meta_out = Valid(new PISAEgressMetaIn)
+  val delivered = Flipped(Valid(new DeliveredEvent))
+  val creditToBtx = Flipped(Valid(new CreditToBtxEvent))
 }
 
 /* Descriptor that is used to schedule TX pkts */
@@ -79,11 +81,24 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   //   There is one free list for each size class.
   val size_class_freelists_io = MsgBufHelpers.make_size_class_freelists() 
 
-  // FIFO queue to schedule delivery of TX pkts
-  // TODO(sibanez): this should become a PIFO ideally
-  val scheduled_pkts_enq = Wire(Decoupled(new TxPktDescriptor))
-  val scheduled_pkts_deq = Wire(Flipped(Decoupled(new TxPktDescriptor)))
-  scheduled_pkts_deq <> Queue(scheduled_pkts_enq, SCHEDULED_PKTS_Q_DEPTH)
+  /* State required for transport support */
+  // table mapping {tx_msg_id => delivered_bitmap}
+  val delivered_table = SyncReadMem(NUM_MSG_BUFFERS, UInt(MAX_PKTS_PER_MSG.W))
+  // table mapping {tx_msg_id => credit}
+  val credit_table = SyncReadMem(NUM_MSG_BUFFERS, UInt(CREDIT_BITS.W))
+  // table mapping {tx_msg_id => toBtx_bitmap}
+  val toBtx_table = SyncReadMem(NUM_MSG_BUFFERS, UInt(MAX_PKTS_PER_MSG.W))
+
+  // Queues to schedule delivery of TX pkts
+  // TODO(sibanez): these should become a PIFO ideally
+  // Queue used for pkts scheduled by Enqueue state machine
+  val init_scheduled_pkts_enq = Wire(Decoupled(new TxPktDescriptor))
+  val init_scheduled_pkts_deq = Wire(Flipped(Decoupled(new TxPktDescriptor)))
+  init_scheduled_pkts_deq <> Queue(init_scheduled_pkts_enq, SCHEDULED_PKTS_Q_DEPTH)
+  // Queue used for pkts scheduled by creditToBtx state machine
+  val credit_scheduled_pkts_enq = Wire(Decoupled(new TxPktDescriptor))
+  val credit_scheduled_pkts_deq = Wire(Flipped(Decoupled(new TxPktDescriptor)))
+  credit_scheduled_pkts_deq <> Queue(credit_scheduled_pkts_enq, SCHEDULED_PKTS_Q_DEPTH)
 
   // defaults
   tx_msg_id_freelist.io.enq.valid := false.B
@@ -124,7 +139,7 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   // defaults
   val enq_context = io.net_in.bits.src_context
   io.net_in.ready := true.B
-  scheduled_pkts_enq.valid := false.B
+  init_scheduled_pkts_enq.valid := false.B
 
   val tx_app_hdr = Wire(new TxAppHdr)
   tx_app_hdr := (new TxAppHdr).fromBits(io.net_in.bits.data)
@@ -168,6 +183,10 @@ class LNICPacketize(implicit p: Parameters) extends Module {
         ctx_state.pkt_bytes := 0.U
         ctx_state.word_count := 0.U // counts the number of words written by CPU for this msg (not including app hdr)
         // TODO(sibanez): initialize state that is indexed by tx_msg_id (for transport support)
+        delivered_table(tx_msg_id) := 0.U 
+        credit_table(tx_msg_id) := RTT_PKTS
+        val num_pkts = MsgBufHelpers.compute_num_pkts(tx_app_hdr.msg_len)
+        toBtx_table(tx_msg_id) := (1.U << num_pkts) - 1.U // every pkt must be transmitted 
         // state transition
         enqStates(enq_context) := sWriteMsg
       }
@@ -195,12 +214,13 @@ class LNICPacketize(implicit p: Parameters) extends Module {
         val is_last_word = ctx_state.rem_bytes <= XBYTES.U
         val is_full_pkt = ctx_state.pkt_bytes + XBYTES.U === MAX_PKT_LEN_BYTES.U
 
+        // TODO(sibanez): should only immediately transmit up to RTT_PKTS, not all pkts
         when (is_last_word || is_full_pkt) {
           // schedule pkt for tx
           // TODO(sibanez): this isn't really a bug, this can legit happen, how best to deal with it?
-          assert (scheduled_pkts_enq.ready, "scheduled_pkts queue is full during enqueue!")
-          scheduled_pkts_enq.valid := true.B
-          scheduled_pkts_enq.bits := tx_pkt_desc
+          assert (init_scheduled_pkts_enq.ready, "scheduled_pkts queue is full during enqueue!")
+          init_scheduled_pkts_enq.valid := true.B
+          init_scheduled_pkts_enq.bits := tx_pkt_desc
         }
 
         when (is_full_pkt) {
@@ -280,11 +300,19 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   switch (deqState) {
     is (sWaitTxPkts) {
       // wait for a TxPktDescriptor to be scheduled
-      when (scheduled_pkts_deq.valid) {
+      // schedule between the various scheduled_pkts queues
+      // NOTE: first RTT pkts of new msgs are strictly prioritized over pkts made
+      //   available from credit update events.
+      when (init_scheduled_pkts_deq.valid) {
         // read descriptor
-        val descriptor = scheduled_pkts_deq.bits
-        scheduled_pkts_deq.ready := true.B
-        tx_next_pkt(descriptor)
+        init_scheduled_pkts_deq.ready := true.B
+        tx_next_pkt(init_scheduled_pkts_deq.bits)
+        // state transition
+        deqState := sSendTxPkts
+      } .elsewhen(credit_scheduled_pkts_deq.valid) {
+        // read descriptor
+        credit_scheduled_pkts_deq.ready := true.B
+        tx_next_pkt(credit_scheduled_pkts_deq.bits)
         // state transition
         deqState := sSendTxPkts
       }
@@ -350,6 +378,150 @@ class LNICPacketize(implicit p: Parameters) extends Module {
     } .otherwise {
         // this is not the last pkt of the msg
         deq_pkt_rem_bytes_reg := MAX_PKT_LEN_BYTES.U
+    }
+  }
+
+  /* Delivered State Machine:
+   * Tasks:
+   *   - Process delivered events from the ingress pipeline
+   *   - Mark pkt of a msg as delivered (i.e. ACKed)
+   *   - Once all pkts have been delivered, free the tx_msg_id and msg buffer
+   */
+  val sReadDelivered :: sWriteDelivered :: Nil = Enum(2)
+  val deliveredState = RegInit(sReadDelivered)
+
+  // pipeline regs to store delivered event
+  val delivered_reg_0 = RegNext(io.delivered)
+  val delivered_reg_1 = RegNext(delivered_reg_0)
+  // read/write port to update delivered state
+  val delivered_ptr = Wire(UInt(LNIC_MSG_ID_BITS.W))
+  delivered_ptr := delivered_reg_0.bits.tx_msg_id
+  val update_delivered_table_port = delivered_table(delivered_ptr)
+
+  // TODO(sibanez): this state machine assumes delivered events will not fire on back-to-back
+  //   cycles. Need 2 cycles to perform RMW of delivered state.
+  assert(!(delivered_reg_0.valid && delivered_reg_1.valid), "Delivered events fired on back-to-back cycles! This is currently unsupported!")
+
+  switch (deliveredState) {
+    is (sReadDelivered) {
+      // start reading delivered state
+      // state transition
+      when (delivered_reg_0.valid) {
+        deliveredState := sWriteDelivered
+      }
+    }
+    is (sWriteDelivered) {
+      // get read result
+      val delivered_bitmap = Wire(UInt(MAX_PKTS_PER_MSG.W))
+      delivered_bitmap := update_delivered_table_port
+
+      // compute updated bitmap
+      val new_delivered_bitmap = Wire(UInt(MAX_PKTS_PER_MSG.W))
+      new_delivered_bitmap := delivered_bitmap | (1.U << delivered_reg_1.bits.pkt_offset)
+      delivered_ptr := delivered_reg_1.bits.tx_msg_id
+      update_delivered_table_port := new_delivered_bitmap
+
+      // check if all pkts have been delivered
+      val num_pkts = MsgBufHelpers.compute_num_pkts(delivered_reg_1.bits.msg_len)
+      when (new_delivered_bitmap === (1.U << num_pkts) - 1.U) {
+        // free tx_msg_id
+        assert(tx_msg_id_freelist.io.enq.ready, "tx_msg_id_freelist is full when trying to free a tx_msg_id!")
+        tx_msg_id_freelist.io.enq.valid := true.B
+        tx_msg_id_freelist.io.enq.bits := delivered_reg_1.bits.tx_msg_id
+        // free msg buffer
+        val buffer_freelist = size_class_freelists_io(delivered_reg_1.bits.buf_size_class)
+        assert(buffer_freelist.enq.ready, "buffer freelist is full when trying to free a msg buffer!")
+        buffer_freelist.enq.valid := true.B
+        buffer_freelist.enq.bits := delivered_reg_1.bits.buf_ptr
+        // TODO(sibanez): fire cancel timer event
+      }
+
+      // state transition
+      deliveredState := sReadDelivered
+    }
+  }
+
+  /* creditToBtx State Machine:
+   * Tasks:
+   *   - Process creditToBtx events from the ingress pipeline
+   *   - 
+   */
+  val sReadState :: sWriteState :: Nil = Enum(2)
+  val creditToBtxState = RegInit(sReadState)
+
+   // pipeline regs to store delivered event
+  val creditToBtx_reg_0 = RegNext(io.creditToBtx)
+  val creditToBtx_reg_1 = RegNext(creditToBtx_reg_0)
+  // read/write port to update delivered state
+  val credit_ptr = Wire(UInt(CREDIT_BITS.W))
+  val toBtx_ptr = Wire(UInt(MAX_PKTS_PER_MSG.W))
+  credit_ptr := creditToBtx_reg_0.bits.tx_msg_id
+  toBtx_ptr := creditToBtx_reg_0.bits.tx_msg_id
+  val update_credit_table_port = credit_table(credit_ptr)
+  val update_toBtx_table_port = toBtx_table(toBtx_ptr)
+
+  // TODO(sibanez): this state machine assumes events will not fire on back-to-back
+  //   cycles. Need 2 cycles to perform RMW of state variables.
+  assert(!(creditToBtx_reg_0.valid && creditToBtx_reg_1.valid), "Delivered events fired on back-to-back cycles! This is currently unsupported!")
+
+  switch (creditToBtxState) {
+    is (sReadState) {
+      // start reading credit and toBtx tables
+      // state transition
+      when (creditToBtx_reg_0.valid) {
+        creditToBtxState := sWriteState
+      }
+    }
+    is (sWriteState) {
+      // get read results
+      val credit = Wire(UInt(CREDIT_BITS.W))
+      val toBtx = Wire(UInt(MAX_PKTS_PER_MSG.W))
+      credit := update_credit_table_port
+      toBtx := update_toBtx_table_port
+
+      // update toBtx with rtx pkt
+      val rtx_toBtx = Mux(creditToBtx_reg_1.bits.rtx,
+                          toBtx | (1.U << creditToBtx_reg_1.bits.rtx_pkt_offset),
+                          toBtx)
+
+      // compute updated credit and toBtx state
+      val new_credit = Wire(UInt(CREDIT_BITS.W))
+      val new_toBtx = Wire(UInt(MAX_PKTS_PER_MSG.W))
+      when (creditToBtx_reg_1.bits.update_credit) {
+        new_credit := creditToBtx_reg_1.bits.new_credit
+        // compute pkts to transmit
+        val tx_pkts = rtx_toBtx & ((1.U << new_credit) - 1.U)
+        // clear bits of pkts to be transmitted
+        new_toBtx := rtx_toBtx ^ tx_pkts
+        when (tx_pkts != 0.U) {
+          // there are pkts to transmit
+          val tx_pkt_desc = Wire(new TxPktDescriptor)
+          tx_pkt_desc.tx_msg_id              := creditToBtx_reg_1.bits.tx_msg_id
+          tx_pkt_desc.tx_pkts                := tx_pkts
+          tx_pkt_desc.buf_ptr                := creditToBtx_reg_1.bits.buf_ptr
+          tx_pkt_desc.size_class             := creditToBtx_reg_1.bits.buf_size_class
+          tx_pkt_desc.tx_app_hdr.dst_ip      := creditToBtx_reg_1.bits.dst_ip
+          tx_pkt_desc.tx_app_hdr.dst_context := creditToBtx_reg_1.bits.dst_context
+          tx_pkt_desc.tx_app_hdr.msg_len     := creditToBtx_reg_1.bits.msg_len
+          tx_pkt_desc.src_context            := creditToBtx_reg_1.bits.src_context
+          // TODO(sibanez): this is not really a bug, it can legit happen, how to handle?
+          assert(credit_scheduled_pkts_enq.ready, "scheduled_pkts queue is full while scheduling a packet!")
+          credit_scheduled_pkts_enq.valid := true.B
+          credit_scheduled_pkts_enq.bits := tx_pkt_desc
+        }
+      } .otherwise {
+        new_credit := credit
+        new_toBtx := rtx_toBtx
+      }
+
+      // update state
+      credit_ptr := creditToBtx_reg_1.bits.tx_msg_id
+      toBtx_ptr  := creditToBtx_reg_1.bits.tx_msg_id
+      update_credit_table_port := new_credit
+      update_toBtx_table_port := new_toBtx
+
+      // state transition
+      creditToBtxState := sReadState
     }
   }
 
