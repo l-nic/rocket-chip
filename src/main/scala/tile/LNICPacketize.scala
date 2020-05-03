@@ -35,30 +35,37 @@ class PacketizeIO extends Bundle {
   val net_in = Flipped(Decoupled(new MsgWord))
   val net_out = Decoupled(new StreamChannel(NET_DP_BITS))
   val meta_out = Valid(new PISAEgressMetaIn)
+  // Events
   val delivered = Flipped(Valid(new DeliveredEvent))
   val creditToBtx = Flipped(Valid(new CreditToBtxEvent))
+  val schedule = Valid(new ScheduleEvent)
+  val reschedule = Valid(new ScheduleEvent)
+  val cancel = Valid(new CancelEvent)
+  val timeout = Flipped(Valid(new TimeoutEvent))
 }
 
-/* Descriptor that is used to schedule TX pkts */
-class TxPktDescriptor extends Bundle {
+class TxMsgDescriptor extends Bundle {
   val tx_msg_id   = UInt(LNIC_MSG_ID_BITS.W)
-  val tx_pkts     = UInt(MAX_PKTS_PER_MSG.W)
   val buf_ptr     = UInt(BUF_PTR_BITS.W)
   val size_class  = UInt(SIZE_CLASS_BITS.W)
   val tx_app_hdr  = new TxAppHdr()
   val src_context = UInt(LNIC_CONTEXT_BITS.W)
 }
 
+/* Descriptor that is used to schedule TX pkts */
+class TxPktDescriptor extends Bundle {
+  val msg_desc    = new TxMsgDescriptor  
+  val tx_pkts     = UInt(MAX_PKTS_PER_MSG.W)
+}
+
 /* State maintained per-context on enqueue */
 class ContextEnqState extends Bundle {
-  val tx_app_hdr = new TxAppHdr()
-  val tx_msg_id  = UInt(LNIC_MSG_ID_BITS.W)
-  val size_class = UInt(SIZE_CLASS_BITS.W)
-  val buf_ptr    = UInt(BUF_PTR_BITS.W)
+  val msg_desc = new TxMsgDescriptor
   val pkt_offset = UInt(PKT_OFFSET_BITS.W)
   val rem_bytes  = UInt(MSG_LEN_BITS.W)
   val pkt_bytes  = UInt(16.W)
   val word_count = UInt(16.W)
+  val toBtx      = UInt(MAX_PKTS_PER_MSG.W)
 }
 
 @chiselName
@@ -99,6 +106,10 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   val credit_scheduled_pkts_enq = Wire(Decoupled(new TxPktDescriptor))
   val credit_scheduled_pkts_deq = Wire(Flipped(Decoupled(new TxPktDescriptor)))
   credit_scheduled_pkts_deq <> Queue(credit_scheduled_pkts_enq, SCHEDULED_PKTS_Q_DEPTH)
+  // Queue used for pkts schedule by timeout state machine
+  val timeout_scheduled_pkts_enq = Wire(Decoupled(new TxPktDescriptor))
+  val timeout_scheduled_pkts_deq = Wire(Flipped(Decoupled(new TxPktDescriptor)))
+  timeout_schedule_pkts_deq <> Queue(timeout_scheduled_pkts_enq, SCHEDULED_PKTS_Q_DEPTH)
 
   // defaults
   tx_msg_id_freelist.io.enq.valid := false.B
@@ -140,6 +151,7 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   val enq_context = io.net_in.bits.src_context
   io.net_in.ready := true.B
   init_scheduled_pkts_enq.valid := false.B
+  io.schedule.valid := false.B
 
   val tx_app_hdr = Wire(new TxAppHdr)
   tx_app_hdr := (new TxAppHdr).fromBits(io.net_in.bits.data)
@@ -158,6 +170,10 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   val enq_buf_ptr = Wire(UInt(BUF_PTR_BITS.W))
   val enq_msg_buf_ram_port = msg_buffer_ram(enq_buf_ptr)
 
+  val tx_msg_id = Wire(UInt(LNIC_MSG_ID_BITS.W))
+  tx_msg_id := tx_msg_id_freelist.io.deq.bits // default
+  val init_toBtx_table_port = toBtx_table(tx_msg_id)
+
   switch (enqStates(enq_context)) {
     is (sWaitAppHdr) {
       // assert back pressure to the CPU if there are no available buffers for this msg
@@ -172,21 +188,33 @@ class LNICPacketize(implicit p: Parameters) extends Module {
         val target_freelist = size_class_freelists_io(target_size_class)
         target_freelist.deq.ready := true.B
         val buf_ptr = target_freelist.deq.bits
+        // build msg descriptor
+        val msg_desc = Wire(new TxMsgDescriptor)
+        msg_desc.tx_msg_id := tx_msg_id
+        msg_desc.buf_ptr := buf_ptr
+        msg_desc.size_class := target_size_class
+        msg_desc.tx_app_hdr := tx_app_hdr
+        msg_desc.src_context := enq_context
         // record per-context enqueue state
         val ctx_state = context_enq_state(enq_context)
-        ctx_state.tx_app_hdr := tx_app_hdr
-        ctx_state.tx_msg_id := tx_msg_id
-        ctx_state.size_class := target_size_class
-        ctx_state.buf_ptr := buf_ptr
+        ctx_state.msg_desc := msg_desc
         ctx_state.pkt_offset := 0.U
         ctx_state.rem_bytes := tx_app_hdr.msg_len
         ctx_state.pkt_bytes := 0.U
         ctx_state.word_count := 0.U // counts the number of words written by CPU for this msg (not including app hdr)
-        // TODO(sibanez): initialize state that is indexed by tx_msg_id (for transport support)
+        val num_pkts = MsgBufHelpers.compute_num_pkts(tx_app_hdr.msg_len)
+        val toBtx = (1.U << num_pkts) - 1.U // every pkt must be transmitted
+        ctx_state.toBtx := toBtx
+        // initialize state that is indexed by tx_msg_id (for transport support)
         delivered_table(tx_msg_id) := 0.U 
         credit_table(tx_msg_id) := RTT_PKTS
-        val num_pkts = MsgBufHelpers.compute_num_pkts(tx_app_hdr.msg_len)
-        toBtx_table(tx_msg_id) := (1.U << num_pkts) - 1.U // every pkt must be transmitted 
+        init_toBtx_table_port := toBtx
+        // initialize timer
+        io.schedule.valid := true.B
+        io.schedule.bits.msg_id := tx_msg_id
+        io.schedule.bits.delay := TIMEOUT_CYCLES.U
+        io.schedule.bits.metadata.rtx_offset := 0.U
+        io.schedule.bits.metadata.msg_desc := msg_desc
         // state transition
         enqStates(enq_context) := sWriteMsg
       }
@@ -204,12 +232,8 @@ class LNICPacketize(implicit p: Parameters) extends Module {
         enq_msg_buf_ram_port(word_offset) := reverse_bytes(io.net_in.bits.data, XBYTES)
         // build tx pkt descriptor just in case we need to schedule a pkt
         val tx_pkt_desc = Wire(new TxPktDescriptor)
-        tx_pkt_desc.tx_msg_id := ctx_state.tx_msg_id
+        tx_pkt_desc.msg_desc := ctx_state.msg_desc
         tx_pkt_desc.tx_pkts := 1.U << ctx_state.pkt_offset
-        tx_pkt_desc.buf_ptr := ctx_state.buf_ptr
-        tx_pkt_desc.size_class := ctx_state.size_class
-        tx_pkt_desc.tx_app_hdr := ctx_state.tx_app_hdr
-        tx_pkt_desc.src_context := enq_context
 
         val is_last_word = ctx_state.rem_bytes <= XBYTES.U
         val is_full_pkt = ctx_state.pkt_bytes + XBYTES.U === MAX_PKT_LEN_BYTES.U
@@ -221,6 +245,10 @@ class LNICPacketize(implicit p: Parameters) extends Module {
           assert (init_scheduled_pkts_enq.ready, "scheduled_pkts queue is full during enqueue!")
           init_scheduled_pkts_enq.valid := true.B
           init_scheduled_pkts_enq.bits := tx_pkt_desc
+          // mark pkt as no longer needing transmission
+          tx_msg_id := ctx_state.msg_desc.tx_msg_id
+          init_toBtx_table_port := ctx_state.toBtx ^ tx_pkt_desc.tx_pkts
+          ctx_state.toBtx := ctx_state.toBtx ^ tx_pkt_desc.tx_pkts
         }
 
         when (is_full_pkt) {
@@ -288,21 +316,22 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   io.net_out.bits.last := false.B
 
   io.meta_out.valid               := is_first_word_reg
-  io.meta_out.bits.dst_ip         := active_tx_desc_reg.tx_app_hdr.dst_ip
-  io.meta_out.bits.dst_context    := active_tx_desc_reg.tx_app_hdr.dst_context
-  io.meta_out.bits.msg_len        := active_tx_desc_reg.tx_app_hdr.msg_len
+  io.meta_out.bits.dst_ip         := active_tx_desc_reg.msg_desc.tx_app_hdr.dst_ip
+  io.meta_out.bits.dst_context    := active_tx_desc_reg.msg_desc.tx_app_hdr.dst_context
+  io.meta_out.bits.msg_len        := active_tx_desc_reg.msg_desc.tx_app_hdr.msg_len
   io.meta_out.bits.pkt_offset     := deq_pkt_offset_reg
-  io.meta_out.bits.src_context    := active_tx_desc_reg.src_context
-  io.meta_out.bits.tx_msg_id      := active_tx_desc_reg.tx_msg_id
-  io.meta_out.bits.buf_ptr        := active_tx_desc_reg.buf_ptr
-  io.meta_out.bits.buf_size_class := active_tx_desc_reg.size_class
+  io.meta_out.bits.src_context    := active_tx_desc_reg.msg_desc.src_context
+  io.meta_out.bits.tx_msg_id      := active_tx_desc_reg.msg_desc.tx_msg_id
+  io.meta_out.bits.buf_ptr        := active_tx_desc_reg.msg_desc.buf_ptr
+  io.meta_out.bits.buf_size_class := active_tx_desc_reg.msg_desc.size_class
 
   switch (deqState) {
     is (sWaitTxPkts) {
       // wait for a TxPktDescriptor to be scheduled
       // schedule between the various scheduled_pkts queues
       // NOTE: first RTT pkts of new msgs are strictly prioritized over pkts made
-      //   available from credit update events.
+      //   available from credit update events which are strictly prioritized over
+      //   pkts scheduled from timeout events.
       when (init_scheduled_pkts_deq.valid) {
         // read descriptor
         init_scheduled_pkts_deq.ready := true.B
@@ -313,6 +342,11 @@ class LNICPacketize(implicit p: Parameters) extends Module {
         // read descriptor
         credit_scheduled_pkts_deq.ready := true.B
         tx_next_pkt(credit_scheduled_pkts_deq.bits)
+        // state transition
+        deqState := sSendTxPkts
+      } .elsewhen(timeout_scheduled_pkts_deq.valid) {
+        timeout_scheduled_pkts_deq.ready := true.B
+        tx_next_pkt(timeout_scheduled_pkts_deq.bits)
         // state transition
         deqState := sSendTxPkts
       }
@@ -356,7 +390,7 @@ class LNICPacketize(implicit p: Parameters) extends Module {
     require(isPow2(MAX_PKT_LEN_BYTES), "MAX_PKT_LEN_BYTES must be a power of 2!")
     val word_offset = pkt_offset << (log2Up(MAX_PKT_LEN_BYTES/NET_DP_BYTES)).U
     // start reading the first word of the first pkt
-    deq_buf_ptr := descriptor.buf_ptr + word_offset
+    deq_buf_ptr := descriptor.msg_desc.buf_ptr + word_offset
     deq_buf_ptr_reg := deq_buf_ptr
     // register to track first word of each pkt
     is_first_word_reg := true.B
@@ -366,11 +400,12 @@ class LNICPacketize(implicit p: Parameters) extends Module {
     new_descriptor.tx_pkts := descriptor.tx_pkts ^ (1.U << pkt_offset)
     active_tx_desc_reg := new_descriptor
     // record bytes remaining for the current pkt
-    val num_pkts = MsgBufHelpers.compute_num_pkts(descriptor.tx_app_hdr.msg_len)
+    val msg_len = descriptor.msg_desc.tx_app_hdr.msg_len
+    val num_pkts = MsgBufHelpers.compute_num_pkts(msg_len)
     when (pkt_offset === num_pkts - 1.U) {
         // this is the last pkt of the msg
         // compute the number of bytes in the last pkt of the msg
-        val msg_len_mod_mtu = descriptor.tx_app_hdr.msg_len(log2Up(MAX_PKT_LEN_BYTES)-1, 0) 
+        val msg_len_mod_mtu = msg_len(log2Up(MAX_PKT_LEN_BYTES)-1, 0) 
         val final_pkt_bytes = Mux(msg_len_mod_mtu === 0.U,
                                   MAX_PKT_LEN_BYTES.U,
                                   msg_len_mod_mtu)
@@ -401,6 +436,9 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   // TODO(sibanez): this state machine assumes delivered events will not fire on back-to-back
   //   cycles. Need 2 cycles to perform RMW of delivered state.
   assert(!(delivered_reg_0.valid && delivered_reg_1.valid), "Delivered events fired on back-to-back cycles! This is currently unsupported!")
+
+  // defaults
+  io.cancel.valid := false.B
 
   switch (deliveredState) {
     is (sReadDelivered) {
@@ -433,7 +471,9 @@ class LNICPacketize(implicit p: Parameters) extends Module {
         assert(buffer_freelist.enq.ready, "buffer freelist is full when trying to free a msg buffer!")
         buffer_freelist.enq.valid := true.B
         buffer_freelist.enq.bits := delivered_reg_1.bits.buf_ptr
-        // TODO(sibanez): fire cancel timer event
+        // fire cancel timer event
+        io.cancel.valid := true.B
+        io.cancel.bits.msg_id := delivered_reg_1.bits.tx_msg_id
       }
 
       // state transition
@@ -496,14 +536,14 @@ class LNICPacketize(implicit p: Parameters) extends Module {
         when (tx_pkts != 0.U) {
           // there are pkts to transmit
           val tx_pkt_desc = Wire(new TxPktDescriptor)
-          tx_pkt_desc.tx_msg_id              := creditToBtx_reg_1.bits.tx_msg_id
+          tx_pkt_desc.msg_desc.tx_msg_id              := creditToBtx_reg_1.bits.tx_msg_id
+          tx_pkt_desc.msg_desc.buf_ptr                := creditToBtx_reg_1.bits.buf_ptr
+          tx_pkt_desc.msg_desc.size_class             := creditToBtx_reg_1.bits.buf_size_class
+          tx_pkt_desc.msg_desc.tx_app_hdr.dst_ip      := creditToBtx_reg_1.bits.dst_ip
+          tx_pkt_desc.msg_desc.tx_app_hdr.dst_context := creditToBtx_reg_1.bits.dst_context
+          tx_pkt_desc.msg_desc.tx_app_hdr.msg_len     := creditToBtx_reg_1.bits.msg_len
+          tx_pkt_desc.msg_desc.src_context            := creditToBtx_reg_1.bits.src_context
           tx_pkt_desc.tx_pkts                := tx_pkts
-          tx_pkt_desc.buf_ptr                := creditToBtx_reg_1.bits.buf_ptr
-          tx_pkt_desc.size_class             := creditToBtx_reg_1.bits.buf_size_class
-          tx_pkt_desc.tx_app_hdr.dst_ip      := creditToBtx_reg_1.bits.dst_ip
-          tx_pkt_desc.tx_app_hdr.dst_context := creditToBtx_reg_1.bits.dst_context
-          tx_pkt_desc.tx_app_hdr.msg_len     := creditToBtx_reg_1.bits.msg_len
-          tx_pkt_desc.src_context            := creditToBtx_reg_1.bits.src_context
           // TODO(sibanez): this is not really a bug, it can legit happen, how to handle?
           assert(credit_scheduled_pkts_enq.ready, "scheduled_pkts queue is full while scheduling a packet!")
           credit_scheduled_pkts_enq.valid := true.B
@@ -522,6 +562,77 @@ class LNICPacketize(implicit p: Parameters) extends Module {
 
       // state transition
       creditToBtxState := sReadState
+    }
+  }
+
+  /* Timeout event processing state machine
+   * Tasks:
+   *   - Read delivered bitmap to figure out which pkts to retransmit
+   *   - Schedule those pkts for retransmission (if any)
+   *   - Fire a reschedule event using the max tx pkt offset
+   */
+  val sReadTimeoutState :: sSchedRtx :: Nil = Enum(2)
+  val timeoutState = RegInit(sReadTimeoutState)
+
+  // pipeline regs
+  val timeout_reg_0 = RegNext(io.timeout.valid)
+  val timeout_reg_1 = RegNext(timeout_reg_0)
+
+  assert(!(timeout_reg_0.valid && timeout_reg_1.valid), "Back-to-back timeout events are unsupported!")
+
+  // TODO(sibanez): we are just adding another port here for now, but this would be the 3rd port
+  //   for this table. This should really access a separate table that is sync'd with the delivered_table
+  //   in the background.
+  // delivered_table read port
+  val timeout_msg_id = Wire(UInt(LNIC_MSG_ID_BITS.W))
+  timeout_msg_id := timeout_reg_0.bits.msg_id
+  val timeout_delivered_table_port = delivered_table(timeout_msg_id) 
+
+  // max_tx_pkt_offset read port
+  val max_tx_pkt_offset_port = max_tx_pkt_offset_table(timeout_msg_id)
+
+  // defaults
+  io.reschedule.valid := false.B
+  timeout_scheduled_pkts_enq.valid := false.B 
+
+  switch (timeoutState) {
+    is (sReadTimeoutState) {
+      // wait for a timeout event
+      when (timeout_reg_0.valid) {
+        // start reading delivered_table and max_tx_pkt_offset_table
+        // state transition
+        timeoutState := sSchedRtx
+      }
+    }
+    is (sSchedRtx) {
+      // get read results
+      val delivered_bitmap = Wire(UInt(MAX_PKTS_PER_MSG.W))
+      delivered_bitmap := timeout_delivered_table_port
+      val max_tx_pkt_offset = Wire(UInt(PKT_OFFSET_BITS.W))
+      max_tx_pkt_offset := max_tx_pkt_offset_port
+
+      // find any pkts to retransmit
+      val rtx_pkts_mask = (1.U << timeout_reg_1.bits.metadata.rtx_offset) - 1.U
+      val rtx_pkts = ~delivered_bitmap & rtx_pkts_mask
+      when (rtx_pkts > 0.U && !reset.toBool) {
+        // there are pkts to retransmit
+        val tx_pkt_desc = Wire(new TxPktDescriptor)
+        tx_pkt_desc.msg_desc := timeout_reg_1.bits.metadata.msg_desc
+        tx_pkt_desc.tx_pkts := rtx_pkts
+        assert(timeout_scheduled_pkts_enq.ready, "schedule_pkts queue is full when processing timeout event!")
+        timeout_scheduled_pkts_enq.valid := true.B
+        timeout_scheduled_pkts_enq.bits := tx_pkt_desc
+      }
+
+      // fire reschedule event
+      io.reschedule.valid := !reset.toBool
+      io.reschedule.bits.msg_id := timeout_reg_1.bits.msg_id
+      io.reschedule.bits.delay := TIMEOUT_CYCLES.U
+      io.reschedule.bits.metadata.rtx_offset := max_tx_pkt_offset
+      io.reschedule.bits.metadata.msg_desc := timeout_reg_1.bits.metadata.msg_desc
+
+      // state transition
+      timeoutState := sReadTimeoutState
     }
   }
 

@@ -73,6 +73,7 @@ object LNICConsts {
   val MSG_LEN_BITS = 16
   // TODO(sibanez): what is the expected range of the credit state?
   val CREDIT_BITS = 16
+  val TIMER_BITS = 64
   // TODO(sibanez): define this ...
   val RTT_PKTS = MAX_PKTS_PER_MSG
 
