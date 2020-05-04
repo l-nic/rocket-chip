@@ -34,6 +34,10 @@ class PISAEgressMetaIn extends Bundle {
   val tx_msg_id      = UInt(LNIC_MSG_ID_BITS.W)
   val buf_ptr        = UInt(BUF_PTR_BITS.W)
   val buf_size_class = UInt(SIZE_CLASS_BITS.W)
+  val pull_offset    = UInt(CREDIT_BITS.W)
+  val genACK = Bool()
+  val genNACK = Bool()
+  val genPULL = Bool()
 }
 
 /**
@@ -46,6 +50,7 @@ class LNICPISAIngressIO extends Bundle {
   val get_rx_msg_info = new GetRxMsgInfoIO
   val delivered = Valid(new DeliveredEvent)
   val creditToBtx = Valid(new CreditToBtxEvent)
+  val ctrlPkt = Valid(new PISAEgressMetaIn)
 
   override def cloneType = new LNICPISAIngressIO().asInstanceOf[this.type]
 }

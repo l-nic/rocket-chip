@@ -77,9 +77,11 @@ object LNICConsts {
   // TODO(sibanez): define this ...
   val RTT_PKTS = MAX_PKTS_PER_MSG
 
+  // TODO(sibanez): how best to size these queues?
   // This queue only builds up if pkts are being scheduled faster than
   // they are being transmitted.
   val SCHEDULED_PKTS_Q_DEPTH = 256
+  val PACED_PKTS_Q_DEPTH = 256
 
   // Message buffers for both packetization and reassembly
   // LinkedHashMap[Int, Int] : {buffer_size (bytes) => num_buffers}
