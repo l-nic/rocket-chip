@@ -59,28 +59,33 @@ class LNICPktGen(implicit p: Parameters) extends Module {
   val ctrlPkt_reg = RegNext(io.ctrlPkt)
 
   when (ctrlPkt_reg.valid && !reset.toBool) {
-    assert(ctrlPkt_reg.bits.genPULL, "Violated assumption that PULL is always generated!") 
     assert(ctrlPkt_reg.bits.genACK || ctrlPkt_reg.bits.genNACK, "Violated assumption that ACK or NACK is always generated!")
 
-    when (stateTokens === sAvailable) {
-      // combine ctrl pkts and schedule immediately
-      schedule_pkt(ctrlPkt_reg.bits)
-      // refill token
-      stateTokens := sRefill
-      // TODO(sibanez): this may cause re-ordering of PULL pkts if the paced queue
-      //   is not empty when this event fires. Is that a problem?
+    when (ctrlPkt_reg.bits.genPULL) {
+      // must check for token availability when generating a PULL
+      when (stateTokens === sAvailable) {
+        // combine ctrl pkts and schedule immediately
+        schedule_pkt(ctrlPkt_reg.bits)
+        // refill token
+        stateTokens := sRefill
+        // TODO(sibanez): this may cause re-ordering of PULL pkts if the paced queue
+        //   is not empty when this event fires. Is that a problem?
+      } .otherwise {
+        // separate out the ACK/NACK from PULL
+        val ack_nack_pkt = Wire(new PISAEgressMetaIn)
+        ack_nack_pkt := ctrlPkt_reg.bits
+        ack_nack_pkt.genPULL := false.B
+        val pull_pkt = Wire(new PISAEgressMetaIn)
+        pull_pkt := ctrlPkt_reg.bits
+        pull_pkt.genACK := false.B
+        pull_pkt.genNACK := false.B
+        // schedule the ACK/NACK immediately and pace the PULL
+        schedule_pkt(ack_nack_pkt)
+        pace_pkt(pull_pkt)
+      }
     } .otherwise {
-      // separate out the ACK/NACK from PULL
-      val ack_nack_pkt = Wire(new PISAEgressMetaIn)
-      ack_nack_pkt := ctrlPkt_reg.bits
-      ack_nack_pkt.genPULL := false.B
-      val pull_pkt = Wire(new PISAEgressMetaIn)
-      pull_pkt := ctrlPkt_reg.bits
-      pull_pkt.genACK := false.B
-      pull_pkt.genNACK := false.B
-      // schedule the ACK/NACK immediately and pace the PULL
-      schedule_pkt(ack_nack_pkt)
-      pace_pkt(pull_pkt)
+      // schedule the ACK/NACK immediately
+      schedule_pkt(ctrlPkt_reg.bits)
     }
 
   } .otherwise {
