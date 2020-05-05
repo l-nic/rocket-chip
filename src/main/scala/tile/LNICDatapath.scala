@@ -90,142 +90,124 @@ class LNICTxQueue(implicit p: Parameters) extends Module {
 }
 
 
-// /**
-//  * LNIC Arbiter classes
-//  * TODO(sibanez): repurpose this module to schedule between control and data
-//  *   pkts on the TX path.
-//  */
-// class ArbiterIO extends Bundle {
-//   val core_in = Flipped(Decoupled(new StreamChannel(NET_DP_BITS)))
-//   val core_meta_in = Flipped(Valid(new PktizeMetaOut))
-//   val net_in = Flipped(Decoupled(new StreamChannel(NET_DP_BITS)))
-//   val net_out = Decoupled(new StreamChannel(NET_DP_BITS))
-//   val meta_out = Valid(new PISAMetaIO)
-// 
-//   override def cloneType = new ArbiterIO().asInstanceOf[this.type]
-// }
-// 
-// @chiselName
-// class LNICArbiter(implicit p: Parameters) extends Module {
-//   val io = IO(new ArbiterIO)
-// 
-//   val pktQueue_in = Wire(Decoupled(new StreamChannel(NET_DP_BITS)))
-//   val metaQueue_in = Wire(Decoupled(new PISAMetaIO))
-//   val metaQueue_out = Wire(Flipped(Decoupled(new PISAMetaIO)))
-// 
-//   // Set up output queues
-//   io.net_out <> Queue(pktQueue_in, p(LNICKey).arbiterPktBufFlits)
-//   metaQueue_out <> Queue(metaQueue_in, p(LNICKey).arbiterMetaBufFlits)
-// 
-//   // state machine to arbitrate between core_in and net_in
-//   // TODO(sibanez): Eventually, I want this arbiter to drain the core_in @ up to line rate,
-//   //   which will prevent pkt drops further down the pipeline.
-//   //   The remaining bandwidth will be used to serve net_in.
-//   //   The datapath width should increase to 128 bits so both inputs can be served at line rate.
-// 
-//   val sInSelect :: sInWaitEnd :: Nil = Enum(2)
-//   val inState = RegInit(sInSelect)
-// 
-//   val reg_selected = RegInit(false.B) // true = CPU, false = network
-// 
-//   // default pktQueue_in
-//   pktQueue_in.valid := false.B
-//   pktQueue_in.bits := io.net_in.bits
-// 
-//   metaQueue_in.valid := false.B
-//   // defaults - used for pkts from network
-//   metaQueue_in.bits.ingress_id := false.B
-//   metaQueue_in.bits.msg_id := 0.U
-//   metaQueue_in.bits.offset := 0.U
-//   metaQueue_in.bits.lnic_src := 0.U
-//   // initialize unused metadata fields (driven by PISA module)
-//   metaQueue_in.bits.egress_id := 0.U;
-//   metaQueue_in.bits.lnic_dst := 0.U;
-//   metaQueue_in.bits.msg_len := 0.U;
-// 
-//   io.core_in.ready := false.B
-//   io.net_in.ready := false.B
-// 
-//   def selectCore() = {
-//     reg_selected := true.B
-//     pktQueue_in <> io.core_in
-//     metaQueue_in.valid := true.B
-//     metaQueue_in.bits.ingress_id := true.B
-//     metaQueue_in.bits.msg_id := io.core_meta_in.bits.msg_id
-//     metaQueue_in.bits.offset := io.core_meta_in.bits.offset
-//     metaQueue_in.bits.lnic_src := io.core_meta_in.bits.lnic_src
-//     when (pktQueue_in.valid && pktQueue_in.ready && pktQueue_in.bits.last) {
-//       inState := sInSelect // stay in same state
-//     } .otherwise {
-//       inState := sInWaitEnd
-//     }
-//   }
-// 
-//   def selectNet() = {
-//     reg_selected := false.B
-//     pktQueue_in <> io.net_in
-//     metaQueue_in.valid := true.B
-//     when (pktQueue_in.valid && pktQueue_in.ready && pktQueue_in.bits.last) {
-//       inState := sInSelect // stay in same state
-//     } .otherwise {
-//       inState := sInWaitEnd
-//     }
-//   }
-// 
-//   switch (inState) {
-//     is (sInSelect) {
-//       // select which input to read from
-//       // write to metaQueue and potentially pktQueue as well
-//       when (reg_selected && io.net_in.valid) {
-//         // selected CPU last time and net_in is valid
-//         selectNet()
-//       } .elsewhen (!reg_selected && io.core_in.valid) {
-//         // selected network last time and core_in is valid
-//         selectCore()
-//       } .elsewhen (reg_selected && io.core_in.valid) {
-//         // selected CPU last time and core_in is valid
-//         selectCore()
-//       } .elsewhen (!reg_selected && io.net_in.valid) {
-//         // selected network last time and net_in is valid
-//         selectNet()
-//       }
-//     }
-//     is (sInWaitEnd) {
-//       when (reg_selected) {
-//         // CPU input selected
-//         pktQueue_in <> io.core_in
-//       } .otherwise {
-//         // network input selected
-//         pktQueue_in <> io.net_in
-//       }
-//       // wait until end of selected pkt then transition back to sSelect
-//       when (pktQueue_in.valid && pktQueue_in.ready && pktQueue_in.bits.last) {
-//         inState := sInSelect
-//       }
-//     }
-//   }
-// 
-//   // state machine to drive metaQueue_out.ready
-//   val sOutWordOne :: sOutWaitEnd :: Nil = Enum(2)
-//   val outState = RegInit(sOutWordOne)
-// 
-//   // only read metaQueue when first word is transferred to PISA pipeline
-//   metaQueue_out.ready := (outState === sOutWordOne) && (io.net_out.valid && io.net_out.ready)
-//   io.meta_out <> metaQueue_out
-// 
-//   switch (outState) {
-//     is (sOutWordOne) {
-//       when (io.net_out.valid && io.net_out.ready && !io.net_out.bits.last) {
-//         outState := sOutWaitEnd
-//       }
-//     }
-//     is (sOutWaitEnd) {
-//       when (io.net_out.valid && io.net_out.ready && io.net_out.bits.last) {
-//         outState := sOutWordOne
-//       }
-//     }
-//   }
-// }
+/**
+ * LNIC Arbiter classes
+ * TODO(sibanez): repurpose this module to schedule between control and data
+ *   pkts on the TX path.
+ */
+class ArbiterIO extends Bundle {
+  // Generated control pkts
+  val ctrl_in = Flipped(Decoupled(new StreamChannel(NET_DP_BITS)))
+  val ctrl_meta_in = Flipped(Valid(new PISAEgressMetaIn))
+  // Packetized data pkts
+  val data_in = Flipped(Decoupled(new StreamChannel(NET_DP_BITS)))
+  val data_meta_in = Flipped(Valid (new PISAEgressMetaIn))
+  // Serialized pkts
+  val net_out = Decoupled(new StreamChannel(NET_DP_BITS))
+  val meta_out = Valid(new PISAEgressMetaIn)
+}
+
+@chiselName
+class LNICArbiter(implicit p: Parameters) extends Module {
+  val io = IO(new ArbiterIO)
+
+  val pktQueue_in = Wire(Decoupled(new StreamChannel(NET_DP_BITS)))
+  val metaQueue_in = Wire(Decoupled(new PISAEgressMetaIn))
+  val metaQueue_out = Wire(Flipped(Decoupled(new PISAEgressMetaIn)))
+
+  // Set up output queues
+  // TODO(sibanez): use params or consts here?
+  io.net_out <> Queue(pktQueue_in, p(LNICKey).arbiterPktBufFlits)
+  metaQueue_out <> Queue(metaQueue_in, p(LNICKey).arbiterMetaBufFlits)
+
+  /* state machine to arbitrate between ctrl_in and data_in */
+
+  val sInSelect :: sInWaitEnd :: Nil = Enum(2)
+  val inState = RegInit(sInSelect)
+
+  val ctrl :: data :: Nil = Enum(2)
+  val reg_selected = RegInit(ctrl)
+
+  // defaults
+  pktQueue_in.valid := false.B
+  pktQueue_in.bits := io.ctrl_in.bits
+  metaQueue_in.valid := false.B
+  metaQueue_in.bits := io.ctrl_meta_in.bits
+
+  io.ctrl_in.ready := false.B
+  io.data_in.ready := false.B
+
+  def selectCtrl() = {
+    reg_selected := ctrl
+    pktQueue_in <> io.ctrl_in
+    metaQueue_in.valid := true.B
+    metaQueue_in.bits := io.ctrl_meta_in.bits
+    when (pktQueue_in.valid && pktQueue_in.ready && pktQueue_in.bits.last) {
+      inState := sInSelect // stay in same state
+    } .otherwise {
+      inState := sInWaitEnd
+    }
+  }
+
+  def selectData() = {
+    reg_selected := data
+    pktQueue_in <> io.data_in
+    metaQueue_in.valid := true.B
+    metaQueue_in.bits := io.data_meta_in.bits
+    when (pktQueue_in.valid && pktQueue_in.ready && pktQueue_in.bits.last) {
+      inState := sInSelect // stay in same state
+    } .otherwise {
+      inState := sInWaitEnd
+    }
+  }
+
+  switch (inState) {
+    is (sInSelect) {
+      // select which input to read from
+      // NOTE: ctrl pkts are strictly prioritized over data pkts
+      when (io.ctrl_in.valid) {
+        selectCtrl()
+      } .elsewhen (io.data_in.valid) {
+        selectData()
+      }
+    }
+    is (sInWaitEnd) {
+      when (reg_selected === ctrl) {
+        // Ctrl pkt selected
+        pktQueue_in <> io.ctrl_in
+      } .otherwise {
+        // Data pkt selected
+        pktQueue_in <> io.data_in
+      }
+      // wait until end of selected pkt then transition back to sSelect
+      when (pktQueue_in.valid && pktQueue_in.ready && pktQueue_in.bits.last) {
+        inState := sInSelect
+      }
+    }
+  }
+
+  // state machine to drive metaQueue_out.ready
+  val sOutWordOne :: sOutWaitEnd :: Nil = Enum(2)
+  val outState = RegInit(sOutWordOne)
+
+  // only read metaQueue when first word is transferred to Egress pipeline
+  metaQueue_out.ready := (outState === sOutWordOne) && (io.net_out.valid && io.net_out.ready)
+  io.meta_out.valid := (outState === sOutWordOne) && (io.net_out.valid && metaQueue_out.valid)
+  io.meta_out.bits := metaQueue_out.bits
+
+  switch (outState) {
+    is (sOutWordOne) {
+      when (io.net_out.valid && io.net_out.ready && !io.net_out.bits.last) {
+        outState := sOutWaitEnd
+      }
+    }
+    is (sOutWaitEnd) {
+      when (io.net_out.valid && io.net_out.ready && io.net_out.bits.last) {
+        outState := sOutWordOne
+      }
+    }
+  }
+}
 
 /**
  * LNIC Per-Context FIFO queues and interrupt generation.

@@ -370,21 +370,14 @@ trait HasLNICModuleImp extends LazyModuleImp with HasTileParameters {
     }
   }
 
-  // Connect core to simulated network.
-  // TODO: maybe insert a module between the core and network that inserts
-  //   timestamps into application payload to compute latency?
-  //   Maybe if the LNIC src context ID == 0 then insert timestamp at the
-  //   specified word offset. But then it's only measuring latency from
-  //   first word to first word.
+  // Connect L-NIC to simulated network.
   def connectSimNetwork(clock: Clock, reset: Bool) {
     netPorts.foreach { net =>
       val sim = Module(new SimNetwork)
-      val latency = Module(new LatencyModule)
       sim.io.clock := clock
       sim.io.reset := reset
-      sim.io.net <> latency.io.net
-      latency.io.nic.in <> net.out
-      net.in <> latency.io.nic.out
+      sim.io.net.out <> net.out
+      net.in <> sim.io.net.in
     }
   }
 
