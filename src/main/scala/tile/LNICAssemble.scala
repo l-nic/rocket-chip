@@ -180,11 +180,13 @@ class LNICAssemble(implicit p: Parameters) extends Module {
         // This msg has already been allocated an rx_msg_id
         io.get_rx_msg_info.resp.bits.fail := false.B
         io.get_rx_msg_info.resp.bits.rx_msg_id := cur_rx_msg_id_table_entry.rx_msg_id
+        io.get_rx_msg_info.resp.bits.is_new_msg := false.B
       } .elsewhen (allocation_success_reg) {
         // This is a new msg and we can allocate a buffer and rx_msg_id
         io.get_rx_msg_info.resp.bits.fail := false.B
         val rx_msg_id = rx_msg_id_freelist.io.deq.bits
         io.get_rx_msg_info.resp.bits.rx_msg_id := rx_msg_id
+        io.get_rx_msg_info.resp.bits.is_new_msg := true.B
         // read from rx_msg_id freelist
         assert(rx_msg_id_freelist.io.deq.valid, "There is an available buffer but not an available rx_msg_id?")
         rx_msg_id_freelist.io.deq.ready := true.B
@@ -207,6 +209,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
         // This is a new msg and we cannot allocate a buffer and rx_msg_id
         io.get_rx_msg_info.resp.bits.fail := true.B
         io.get_rx_msg_info.resp.bits.rx_msg_id := 0.U
+        io.get_rx_msg_info.resp.bits.is_new_msg := true.B
       }
     }
   }

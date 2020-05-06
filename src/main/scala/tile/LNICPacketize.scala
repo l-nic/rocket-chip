@@ -324,6 +324,10 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   io.meta_out.bits.tx_msg_id      := active_tx_desc_reg.msg_desc.tx_msg_id
   io.meta_out.bits.buf_ptr        := active_tx_desc_reg.msg_desc.buf_ptr
   io.meta_out.bits.buf_size_class := active_tx_desc_reg.msg_desc.size_class
+  io.meta_out.bits.pull_offset    := 0.U
+  io.meta_out.bits.genACK         := false.B
+  io.meta_out.bits.genNACK         := false.B
+  io.meta_out.bits.genPULL         := false.B
 
   switch (deqState) {
     is (sWaitTxPkts) {
@@ -484,15 +488,14 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   /* creditToBtx State Machine:
    * Tasks:
    *   - Process creditToBtx events from the ingress pipeline
-   *   - 
    */
   val sReadState :: sWriteState :: Nil = Enum(2)
   val creditToBtxState = RegInit(sReadState)
 
-   // pipeline regs to store delivered event
+  // pipeline regs to store creditToBtx event
   val creditToBtx_reg_0 = RegNext(io.creditToBtx)
   val creditToBtx_reg_1 = RegNext(creditToBtx_reg_0)
-  // read/write port to update delivered state
+  // read/write port to update creditToBtx state
   val credit_ptr = Wire(UInt(CREDIT_BITS.W))
   val toBtx_ptr = Wire(UInt(MAX_PKTS_PER_MSG.W))
   credit_ptr := creditToBtx_reg_0.bits.tx_msg_id

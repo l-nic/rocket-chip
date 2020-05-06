@@ -169,14 +169,32 @@ class LNICModuleImp(outer: LNIC)(implicit p: Parameters) extends LazyModuleImp(o
   val assemble = Module(new LNICAssemble)
   val packetize = Module(new LNICPacketize)
 
+  val msg_timers = Module(new LNICTimers)
+  val credit_reg = Module(new IfElseRaw)
+  val pkt_gen = Module(new LNICPktGen)
+  val arbiter = Module(new LNICArbiter)
+
   pisa_ingress.io.clock := clock
   pisa_ingress.io.reset := reset
   pisa_egress.io.clock := clock
   pisa_egress.io.reset := reset
 
-  // get_rx_msg_info extern call
+  ////////////////////////////////
+  /* Event / Extern Connections */
+  ////////////////////////////////
+  credit_reg.io <> pisa_ingress.io.net.creditReg
   assemble.io.get_rx_msg_info <> pisa_ingress.io.net.get_rx_msg_info
+  packetize.io.delivered := pisa_ingress.io.net.delivered
+  packetize.io.creditToBtx := pisa_ingress.io.net.creditToBtx
+  pkt_gen.io.ctrlPkt := pisa_ingress.io.net.ctrlPkt
+  msg_timers.io.schedule := packetize.io.schedule
+  msg_timers.io.reschedule := packetize.io.reschedule
+  msg_timers.io.cancel := packetize.io.cancel
+  packetize.io.timeout := msg_timers.io.timeout
 
+  //////////////////////////
+  /* Datapath Connections */
+  //////////////////////////
   // 64-bit => 512-bit
   StreamWidthAdapter(pisa_ingress.io.net.net_in,
                      io.net.in)
@@ -189,8 +207,14 @@ class LNICModuleImp(outer: LNIC)(implicit p: Parameters) extends LazyModuleImp(o
 
   packetize.io.net_in <> io.core.net_in
 
-  pisa_egress.io.net.net_in <> packetize.io.net_out
-  pisa_egress.io.net.meta_in := packetize.io.meta_out
+  arbiter.io.data_in <> packetize.io.net_out
+  arbiter.io.data_meta_in := packetize.io.meta_out
+
+  arbiter.io.ctrl_in <> pkt_gen.io.net_out
+  arbiter.io.ctrl_meta_in := pkt_gen.io.meta_out
+
+  pisa_egress.io.net.net_in <> arbiter.io.net_out
+  pisa_egress.io.net.meta_in := arbiter.io.meta_out
 
   // 512-bit => 64-bit
   StreamWidthAdapter(io.net.out,

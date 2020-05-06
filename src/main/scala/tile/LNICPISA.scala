@@ -51,6 +51,7 @@ class LNICPISAIngressIO extends Bundle {
   val delivered = Valid(new DeliveredEvent)
   val creditToBtx = Valid(new CreditToBtxEvent)
   val ctrlPkt = Valid(new PISAEgressMetaIn)
+  val creditReg = new IfElseRawIO
 
   override def cloneType = new LNICPISAIngressIO().asInstanceOf[this.type]
 }
@@ -83,6 +84,7 @@ class GetRxMsgInfoResp extends Bundle {
   val fail = Bool()
   val rx_msg_id = UInt(LNIC_MSG_ID_BITS.W)
   // TODO(sibanez): add additional fields for transport processing
+  val is_new_msg = Bool()
 }
 
 class DeliveredEvent extends Bundle {
@@ -126,4 +128,97 @@ class SDNetEgressWrapper extends BlackBox with HasBlackBoxResource {
     val net = new LNICPISAEgressIO
   })
 }
+
+/* IfElseRawReg Extern */
+class IfElseRawIO extends Bundle {
+  val req = Valid(new IfElseRawReq)
+  val resp = Flipped(Valid(new IfElseRawResp))
+}
+
+class IfElseRawReq extends Bundle {
+  val index = UInt(LNIC_MSG_ID_BITS.W)
+  val data_1 = UInt(CREDIT_BITS.W)
+  val opCode_1 = UInt(8.W)
+  val data_0 = UInt(CREDIT_BITS.W)
+  val opCode_0 = UInt(8.W)
+  val predicate = Bool()
+}
+
+class IfElseRawResp extends Bundle {
+  val new_val = UInt(CREDIT_BITS.W)
+}
+
+@chiselName
+class IfElseRaw(implicit p: Parameters) extends Module {
+  val io = IO(Flipped(new IfElseRawIO))
+
+  val ram = SyncReadMem(NUM_MSG_BUFFERS, UInt(CREDIT_BITS.W))
+
+  /* state machine to perform RMW ops on ram */
+
+  val REG_READ  = 0.U
+  val REG_WRITE = 1.U
+  val REG_ADD   = 2.U
+
+  val sRead :: sWrite :: Nil = Enum(2)
+  val state = RegInit(sRead)
+
+  // pipeline reg
+  val req_reg_0 = RegNext(io.req)
+  val req_reg_1 = RegNext(req_reg_0)
+
+  // Need 2 cycles for RMW operation
+  assert(!(req_reg_0.valid && req_reg_1.valid), "Violated assumption that requests will not arrive on back-to-back cycles!")
+
+  val ram_ptr = Wire(UInt(LNIC_MSG_ID_BITS.W))
+  ram_ptr := req_reg_0.bits.index
+  val ram_port = ram(ram_ptr)
+
+  switch(state) {
+    is (sRead) {
+      when (req_reg_0.valid) {
+        // start reading ram
+        state := sWrite
+      }
+    }
+    is (sWrite) {
+      // get read result
+      val cur_val = Wire(UInt(CREDIT_BITS.W))
+      cur_val := ram_port
+
+      // compute new val
+      val new_val = Wire(UInt(CREDIT_BITS.W))
+      when (req_reg_1.bits.predicate) {
+        // do opCode_0
+        doRMW(cur_val, req_reg_1.bits.opCode_0, req_reg_1.bits.data_0, new_val)
+      } .otherwise {
+        // do opCode_1
+        doRMW(cur_val, req_reg_1.bits.opCode_1, req_reg_1.bits.data_1, new_val)
+      }
+
+      // update ram
+      ram_ptr := req_reg_1.bits.index
+      ram_port := new_val
+
+      // state transition
+      state := sRead
+    }
+  }
+
+  def doRMW(cur_val: UInt, opCode: UInt, data: UInt, new_val: UInt) = {
+    switch (opCode) {
+      is (REG_READ) {
+        new_val := cur_val
+      }
+      is (REG_WRITE) {
+        new_val := data
+      }
+      is (REG_ADD) {
+        new_val := cur_val + data
+      }
+    }
+  }
+
+}
+
 

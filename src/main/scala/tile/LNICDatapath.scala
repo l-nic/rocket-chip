@@ -92,8 +92,7 @@ class LNICTxQueue(implicit p: Parameters) extends Module {
 
 /**
  * LNIC Arbiter classes
- * TODO(sibanez): repurpose this module to schedule between control and data
- *   pkts on the TX path.
+ * Used to schedule between control pkts (PktGen) and data pkts (Packetize) on the TX path.
  */
 class ArbiterIO extends Bundle {
   // Generated control pkts
@@ -215,7 +214,7 @@ class LNICArbiter(implicit p: Parameters) extends Module {
  * Tasks:
  *   - Receive messages from the reassembly buffer.
  *   - The messages indicate which context they are for.
- *   - If the corresponding FIFO is full then drop the message. TODO(sibanez): update this to exert back-pressure instead.
+ *   - If the corresponding FIFO is full then exert back-pressure.
  *   - Otherwise, write the message into the FIFO by reading from the free list and adding to the appropriate linked-list.
  *   - If the message is for a context that has a higher priority than the current_priority input signal (0 is highest priority)
  *     then generate an interrupt and update top_context and top_priority output signals
@@ -292,7 +291,6 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   // create memory used to store msg words
   val ram = Mem(num_entries, new FIFOWord(ptrBits))
   // create free list for msg words
-  // TODO(sibanez): update entries to be a Seq[UInt]
   val entries = for (i <- 0 until num_entries) yield i.U(log2Up(num_entries).W)
   val freelist = Module(new FreeList(entries))
   // create tables for indexing head/tail of FIFOs in the RAM
