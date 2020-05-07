@@ -1,59 +1,41 @@
-#ifndef __ICENET_DEVICE_H__
-#define __ICENET_DEVICE_H__
+#ifndef __NET_DEVICE_H__
+#define __NET_DEVICE_H__
+
+#include <vpi_user.h>
+#include <svdpi.h>
 
 #include <queue>
 #include <stdint.h>
 #include <cassert>
 
-#include "fesvr/context.h"
 #include "packet.h"
 
 class NetworkDevice {
   public:
-    NetworkDevice(uint64_t macaddr);
+    NetworkDevice(const char *ifname);
     ~NetworkDevice();
 
-    void tick(
-            bool out_valid,
-            uint64_t out_data,
-            bool out_last,
-            bool in_ready);
+    void tick_tx(bool tx_valid,
+                 uint64_t tx_data,
+                 uint8_t tx_keep,
+                 bool tx_last);
 
-    bool out_ready() { return true; }
-    bool in_valid() { return !in_flits.empty(); }
-    uint64_t in_data() { return (in_valid()) ? in_flits.front().data : 0; }
-    bool in_last() { return (in_valid()) ? in_flits.front().last : false; }
-    void switch_to_host(void) { host.switch_to(); }
-    void send_out(struct network_flit &flt) { out_flits.push(flt); }
-    struct network_flit recv_in(void) {
-        struct network_flit flt = in_flits.front();
-        in_flits.pop();
-        return flt;
-    }
-    uint64_t macaddr() { return _macaddr; }
-    void set_macaddr(uint64_t macaddr) { _macaddr = macaddr; }
-    bool has_out_packet(void) { return !out_packets.empty(); }
-    network_packet *pop_out_packet(void) {
-        network_packet *pkt = out_packets.front();
-        out_packets.pop();
-        return pkt;
-    }
-    void push_in_packet(network_packet *packet) { in_packets.push(packet); }
+    void tick_rx(bool rx_ready);
+
+    bool tx_ready() { return true; }
+    bool rx_valid() { return !rx_flits.empty(); }
+    uint64_t rx_data() { return (rx_valid()) ? rx_flits.front().data : 0; }
+    uint8_t rx_keep() { return (rx_valid()) ? rx_flits.front().keep : 0; }
+    bool rx_last() { return (rx_valid()) ? rx_flits.front().last : false; }
 
   protected:
-    std::queue<network_flit> out_flits;
-    std::queue<network_flit> in_flits;
+    int fd;
+    std::queue<network_flit> tx_flits;
+    std::queue<network_flit> rx_flits;
 
-    std::queue<network_packet*> out_packets;
-    std::queue<network_packet*> in_packets;
+    std::queue<network_packet*> tx_packets;
+    std::queue<network_packet*> rx_packets;
 
-    static void host_thread(void *arg);
-    virtual void run(void);
-
-    context_t* target;
-    context_t host;
-
-    uint64_t _macaddr;
 };
 
 #endif

@@ -1,51 +1,53 @@
 #include <vpi_user.h>
 #include <svdpi.h>
 
+#include <stdio.h>
+#include <string>
+#include <unordered_map>
+
 #include "device.h"
-#include "switch.h"
 
-// TODO(sibanez): consolidate with LNICConsts
-// NOTE: the byte order is reversed here ...
-#define NIC_MAC_ADDR 0x084433221108
-
-class NetworkSwitch *netsw = NULL;
-class NetworkDevice *netdev = NULL;
+std::unordered_map<std::string, NetworkDevice*> netdev_map;
 
 extern "C" void network_init(const char *devname)
 {
-    netsw = new NetworkSwitch(devname);
-    netdev = new NetworkDevice(NIC_MAC_ADDR);
-
-    netsw->add_device(netdev);
+    netdev_map[std::string(devname)] = new NetworkDevice(devname);
 }
 
 extern "C" void network_tick(
-        unsigned char out_valid,
-        unsigned char *out_ready,
-        long long     out_data,
-        unsigned char out_last,
+        const char *devname,
 
-        unsigned char *in_valid,
-        unsigned char in_ready,
-        long long     *in_data,
-        unsigned char *in_last)
+        unsigned char tx_valid,
+        unsigned char *tx_ready,
+        long long     tx_data,
+        char          tx_keep,
+        unsigned char tx_last,
+
+        unsigned char *rx_valid,
+        unsigned char rx_ready,
+        long long     *rx_data,
+        char          *rx_keep,
+        unsigned char *rx_last)
 {
-    if (!netdev || !netsw) {
-        *out_ready = 0;
-        *in_valid = 0;
-        *in_data = 0;
-        *in_last = 0;
+    NetworkDevice *netdev = netdev_map[std::string(devname)];
+
+    if (!netdev) {
+        *tx_ready = 0;
+        *rx_valid = 0;
+        *rx_data = 0;
+        *rx_keep = 0;
+        *rx_last = 0;
         return;
     }
 
-    netdev->tick(out_valid, out_data, out_last, in_ready);
-    netdev->switch_to_host();
+    netdev->tick_tx(tx_valid, tx_data, tx_keep, tx_last);
 
-    netsw->distribute();
-    netsw->switch_to_worker();
+    *tx_ready = netdev->tx_ready();
+    *rx_valid = netdev->rx_valid();
+    *rx_data = netdev->rx_data();
+    *rx_keep = netdev->rx_keep();
+    *rx_last = netdev->rx_last();
 
-    *out_ready = netdev->out_ready();
-    *in_valid = netdev->in_valid();
-    *in_data = netdev->in_data();
-    *in_last = netdev->in_last();
+    netdev->tick_rx(rx_ready);
+
 }

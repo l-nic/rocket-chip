@@ -1,90 +1,76 @@
-import "DPI-C" function void network_tick
-(
-    input  bit     out_valid,
-    output bit     out_ready,
-    input  longint out_data,
-    input  bit     out_last,
 
-    output bit     in_valid,
-    input  bit     in_ready,
-    output longint in_data,
-    output bit     in_last
+import "DPI-C" function void network_tick (
+    input string devname,
+
+    input  bit     tx_valid,
+    output bit     tx_ready,
+    input  longint tx_data,
+    input  byte    tx_keep,
+    input  bit     tx_last,
+
+    output bit     rx_valid,
+    input  bit     rx_ready,
+    output longint rx_data,
+    output byte    rx_keep,
+    output bit     rx_last
 );
 
-import "DPI-C" function void network_init(
+import "DPI-C" function void network_init (
     input string devname
 );
 
-module SimNetwork(
-    input         clock,
-    input         reset,
+module SimNetwork #(
+  parameter DEVNAME = "tap0"
+)
+(
+    input             clock,
+    input             reset,
 
-    input         net_out_valid,
-    output        net_out_ready,
-    input  [63:0] net_out_bits_data,
-    input  [7:0]  net_out_bits_keep,
-    input         net_out_bits_last,
+    // TX packets: HW --> tap iface
+    input             net_out_valid,
+    output reg        net_out_ready,
+    input  [63:0]     net_out_bits_data,
+    input  [7:0]      net_out_bits_keep,
+    input             net_out_bits_last,
 
-    output        net_in_valid,
-    input         net_in_ready,
-    output [63:0] net_in_bits_data,
-    output [7:0]  net_in_bits_keep,
-    output        net_in_bits_last
+    // RX packets: tap iface --> HW
+    output reg        net_in_valid,
+    input             net_in_ready,
+    output reg [63:0] net_in_bits_data,
+    output reg [7:0]  net_in_bits_keep,
+    output reg        net_in_bits_last
 );
 
-    string devname = "tap0";
-    int dummy;
-
-    bit __out_ready;
-    bit __in_valid;
-    longint __in_data;
-    bit __in_last;
-
-    reg        __out_ready_reg;
-    reg        __in_valid_reg;
-    reg [63:0] __in_data_reg;
-    reg        __in_last_reg;
+    string devname = DEVNAME;
 
     initial begin
-        dummy = $value$plusargs("netdev=%s", devname);
         network_init(devname);
     end
 
-    /* verilator lint_off WIDTH */
-    always @(posedge clock) begin
+    always@(posedge clock) begin
         if (reset) begin
-            __out_ready = 0;
-            __in_valid = 0;
-            __in_data = 0;
-            __in_last = 0;
-
-            __out_ready_reg <= 1'b0;
-            __in_valid_reg <= 1'b0;
-            __in_data_reg <= 64'b0;
-            __in_last_reg <= 1'b0;
-        end else begin
+            net_out_ready <= 0;
+            net_in_valid <= 0;
+            net_in_bits_data <= 0;
+            net_in_bits_keep <= 0;
+            net_in_bits_last <= 0;
+        end
+        else begin
             network_tick(
+                devname,
+
                 net_out_valid,
-                __out_ready,
+                net_out_ready,
                 net_out_bits_data,
+                net_out_bits_keep,
                 net_out_bits_last,
-
-                __in_valid,
+    
+                net_in_valid,
                 net_in_ready,
-                __in_data,
-                __in_last);
-
-            __out_ready_reg <= __out_ready;
-            __in_valid_reg <= __in_valid;
-            __in_data_reg <= __in_data;
-            __in_last_reg <= __in_last;
+                net_in_bits_data,
+                net_in_bits_keep,
+                net_in_bits_last);
         end
     end
-
-    assign net_out_ready = __out_ready_reg;
-    assign net_in_valid = __in_valid_reg;
-    assign net_in_bits_data = __in_data_reg;
-    assign net_in_bits_keep = 8'hff;
-    assign net_in_bits_last = __in_last_reg;
 
 endmodule
