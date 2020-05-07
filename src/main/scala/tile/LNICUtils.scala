@@ -43,7 +43,7 @@ object MsgBufHelpers {
 
 object MemHelpers {
   // Initialize all memory entries with the provided value
-  def memory_init[T <: Data](mem_port: T, wr_addr: UInt, num_entries: Int, reset_val: T) = {
+  def memory_init[T <: Data](mem_port: T, wr_addr: UInt, num_entries: Int, reset_val: T, init_done: Bool) = {
 
     val sReset :: sIdle :: Nil = Enum(2)
     val state = RegInit(sReset)
@@ -52,6 +52,7 @@ object MemHelpers {
 
     switch(state) {
       is (sReset) {
+        init_done := false.B
         wr_addr := index
         mem_port := reset_val
         index := index + 1.U
@@ -59,7 +60,9 @@ object MemHelpers {
           state := sIdle
         }
       }
-      is (sIdle) { }
+      is (sIdle) {
+        init_done := true.B
+      }
     }
 
   }

@@ -95,6 +95,8 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   val credit_table = SyncReadMem(NUM_MSG_BUFFERS, UInt(CREDIT_BITS.W))
   // table mapping {tx_msg_id => toBtx_bitmap}
   val toBtx_table = SyncReadMem(NUM_MSG_BUFFERS, UInt(MAX_PKTS_PER_MSG.W))
+  // table mapping {tx_msg_id => max pkt offset of the msg}
+  val max_tx_pkt_offset_table = SyncReadMem(NUM_MSG_BUFFERS, UInt(PKT_OFFSET_BITS.W))
 
   // Queues to schedule delivery of TX pkts
   // TODO(sibanez): these should become a PIFO ideally
@@ -109,7 +111,7 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   // Queue used for pkts schedule by timeout state machine
   val timeout_scheduled_pkts_enq = Wire(Decoupled(new TxPktDescriptor))
   val timeout_scheduled_pkts_deq = Wire(Flipped(Decoupled(new TxPktDescriptor)))
-  timeout_schedule_pkts_deq <> Queue(timeout_scheduled_pkts_enq, SCHEDULED_PKTS_Q_DEPTH)
+  timeout_scheduled_pkts_deq <> Queue(timeout_scheduled_pkts_enq, SCHEDULED_PKTS_Q_DEPTH)
 
   // defaults
   tx_msg_id_freelist.io.enq.valid := false.B
@@ -118,6 +120,7 @@ class LNICPacketize(implicit p: Parameters) extends Module {
     io.enq.valid := false.B
     io.deq.ready := false.B
   })
+  credit_scheduled_pkts_enq.valid := false.B
 
   /**
    * Msg Enqueue State Machine.
@@ -207,8 +210,10 @@ class LNICPacketize(implicit p: Parameters) extends Module {
         ctx_state.toBtx := toBtx
         // initialize state that is indexed by tx_msg_id (for transport support)
         delivered_table(tx_msg_id) := 0.U 
-        credit_table(tx_msg_id) := RTT_PKTS
+        credit_table(tx_msg_id) := RTT_PKTS.U
         init_toBtx_table_port := toBtx
+        // NOTE: we could also initialize max_tx_pkt_offset_table here but that would require
+        //   an extra port so we will do that initialization in the dequeue state machine.
         // initialize timer
         io.schedule.valid := true.B
         io.schedule.bits.msg_id := tx_msg_id
@@ -227,7 +232,7 @@ class LNICPacketize(implicit p: Parameters) extends Module {
         val word_offset_bits = log2Up(NET_DP_BITS/XLEN)
         val word_offset = ctx_state.word_count(word_offset_bits-1, 0)
         val word_ptr = ctx_state.word_count(15, word_offset_bits)
-        enq_buf_ptr := ctx_state.buf_ptr + word_ptr
+        enq_buf_ptr := ctx_state.msg_desc.buf_ptr + word_ptr
         // TODO(sibanez): check that this properly implements a sub-word write
         enq_msg_buf_ram_port(word_offset) := reverse_bytes(io.net_in.bits.data, XBYTES)
         // build tx pkt descriptor just in case we need to schedule a pkt
@@ -308,6 +313,13 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   val deq_pkt_offset_reg = RegInit(0.U(PKT_OFFSET_BITS.W))
   // register to track first word of each pkt (used to drive meta_out.valid)
   val is_first_word_reg = RegInit(false.B)
+  // register to track if the descriptor came from a CPU write and
+  // hence if the max_tx_pkt_offset state should be initialized
+  val init_max_pkt_offset_reg = RegInit(false.B)
+
+  val deq_tx_msg_id = Wire(UInt(LNIC_MSG_ID_BITS.W))
+  val update_max_tx_pkt_offset_port = max_tx_pkt_offset_table(deq_tx_msg_id)
+  deq_tx_msg_id := active_tx_desc_reg.msg_desc.tx_msg_id
 
   // defaults
   io.net_out.valid     := false.B
@@ -342,17 +354,21 @@ class LNICPacketize(implicit p: Parameters) extends Module {
         tx_next_pkt(init_scheduled_pkts_deq.bits)
         // state transition
         deqState := sSendTxPkts
-      } .elsewhen(credit_scheduled_pkts_deq.valid) {
+        // This is a descriptor for one of the first pkts of the msg -- initialize the max_tx_pkt_offset state
+        init_max_pkt_offset_reg := true.B
+      } .elsewhen (credit_scheduled_pkts_deq.valid) {
         // read descriptor
         credit_scheduled_pkts_deq.ready := true.B
         tx_next_pkt(credit_scheduled_pkts_deq.bits)
         // state transition
         deqState := sSendTxPkts
-      } .elsewhen(timeout_scheduled_pkts_deq.valid) {
+        init_max_pkt_offset_reg := false.B
+      } .elsewhen (timeout_scheduled_pkts_deq.valid) {
         timeout_scheduled_pkts_deq.ready := true.B
         tx_next_pkt(timeout_scheduled_pkts_deq.bits)
         // state transition
         deqState := sSendTxPkts
+        init_max_pkt_offset_reg := false.B
       }
     }
     is (sSendTxPkts) {
@@ -383,6 +399,14 @@ class LNICPacketize(implicit p: Parameters) extends Module {
           is_first_word_reg := false.B
         }
       }
+
+      // update max_tx_pkt_offset state
+      val cur_max_pkt_offset = Wire(UInt(PKT_OFFSET_BITS.W))
+      cur_max_pkt_offset := update_max_tx_pkt_offset_port
+      when (init_max_pkt_offset_reg || deq_pkt_offset_reg > cur_max_pkt_offset) {
+        update_max_tx_pkt_offset_port := deq_pkt_offset_reg
+      }
+
     }
   }
 
@@ -393,9 +417,11 @@ class LNICPacketize(implicit p: Parameters) extends Module {
     // find the word offset from the buf_ptr: pkt_offset*words_per_mtu
     require(isPow2(MAX_PKT_LEN_BYTES), "MAX_PKT_LEN_BYTES must be a power of 2!")
     val word_offset = pkt_offset << (log2Up(MAX_PKT_LEN_BYTES/NET_DP_BYTES)).U
-    // start reading the first word of the first pkt
+    // start reading the first word of the pkt
     deq_buf_ptr := descriptor.msg_desc.buf_ptr + word_offset
     deq_buf_ptr_reg := deq_buf_ptr
+    // start reading max_tx_pkt_offset state
+    deq_tx_msg_id := descriptor.msg_desc.tx_msg_id
     // register to track first word of each pkt
     is_first_word_reg := true.B
     // record the updated descriptor
@@ -536,7 +562,7 @@ class LNICPacketize(implicit p: Parameters) extends Module {
         val tx_pkts = rtx_toBtx & ((1.U << new_credit) - 1.U)
         // clear bits of pkts to be transmitted
         new_toBtx := rtx_toBtx ^ tx_pkts
-        when (tx_pkts != 0.U) {
+        when (tx_pkts =/= 0.U) {
           // there are pkts to transmit
           val tx_pkt_desc = Wire(new TxPktDescriptor)
           tx_pkt_desc.msg_desc.tx_msg_id              := creditToBtx_reg_1.bits.tx_msg_id
@@ -578,7 +604,7 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   val timeoutState = RegInit(sReadTimeoutState)
 
   // pipeline regs
-  val timeout_reg_0 = RegNext(io.timeout.valid)
+  val timeout_reg_0 = RegNext(io.timeout)
   val timeout_reg_1 = RegNext(timeout_reg_0)
 
   assert(!(timeout_reg_0.valid && timeout_reg_1.valid), "Back-to-back timeout events are unsupported!")

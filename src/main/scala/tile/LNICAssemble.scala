@@ -13,7 +13,6 @@ import freechips.rocketchip.rocket._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util._
 import NetworkHelpers._
-import MemHelpers._
 import LNICConsts._
 
 /**
@@ -145,7 +144,8 @@ class LNICAssemble(implicit p: Parameters) extends Module {
   io.get_rx_msg_info.resp.valid := false.B
 
   // memory initialization
-  MemHelpers.memory_init(rx_msg_id_table_port, msg_key, NUM_MSG_BUFFERS, (new RxMsgIdTableEntry).fromBits(0.U))
+  val init_done_reg = RegInit(false.B)
+  MemHelpers.memory_init(rx_msg_id_table_port, msg_key, NUM_MSG_BUFFERS, (new RxMsgIdTableEntry).fromBits(0.U), init_done_reg)
 
   // True if both an rx_msg_id and buffer are available for this msg
   val allocation_success_reg = RegInit(false.B)

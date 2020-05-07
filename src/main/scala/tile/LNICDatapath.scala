@@ -119,6 +119,10 @@ class LNICArbiter(implicit p: Parameters) extends Module {
   io.net_out <> Queue(pktQueue_in, p(LNICKey).arbiterPktBufFlits)
   metaQueue_out <> Queue(metaQueue_in, p(LNICKey).arbiterMetaBufFlits)
 
+  when (reset.toBool) {
+    io.net_out.valid := false.B
+  }
+
   /* state machine to arbitrate between ctrl_in and data_in */
 
   val sInSelect :: sInWaitEnd :: Nil = Enum(2)

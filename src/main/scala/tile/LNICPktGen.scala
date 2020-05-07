@@ -108,7 +108,7 @@ class LNICPktGen(implicit p: Parameters) extends Module {
     is (sRefill) {
       when (timer_reg === (MTU_CYCLES - 1).U) {
         timer_reg := 0.U
-        stateTokens := sWait
+        stateTokens := sAvailable
       } .otherwise {
         timer_reg := timer_reg + 1.U
       }

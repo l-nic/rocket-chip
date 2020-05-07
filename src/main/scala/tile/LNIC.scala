@@ -67,6 +67,12 @@ object LNICConsts {
   val MAX_PKTS_PER_MSG = 16
   val MAX_PKT_LEN_BYTES = 1024
 
+  // Compute how long to wait b/w sending PULL pkts
+  val LINK_RATE_GBPS = 100
+  val MTU_CYCLES = ((MAX_PKT_LEN_BYTES*8)/LINK_RATE_GBPS).toInt
+
+  val TIMEOUT_CYCLES = 30000 // ~100us @ 300MHz
+
   val BUF_PTR_BITS = 16
   val SIZE_CLASS_BITS = 8
   val PKT_OFFSET_BITS = 8
@@ -426,8 +432,8 @@ class SimNetwork extends BlackBox with HasBlackBoxResource {
 
   addResource("/vsrc/SimNetwork.v")
   addResource("/csrc/SimNetwork.cc")
-  addResource("/csrc/switch.h")
-  addResource("/csrc/switch.cc")
+//  addResource("/csrc/switch.h")
+//  addResource("/csrc/switch.cc")
   addResource("/csrc/device.h")
   addResource("/csrc/device.cc")
   addResource("/csrc/packet.h")

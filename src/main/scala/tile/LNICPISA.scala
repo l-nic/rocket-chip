@@ -4,6 +4,7 @@ package freechips.rocketchip.tile
 import Chisel._
 
 import chisel3.experimental._
+import chisel3.SyncReadMem
 import chisel3.util.{HasBlackBoxResource}
 import freechips.rocketchip.config._
 import freechips.rocketchip.subsystem._
@@ -174,6 +175,9 @@ class IfElseRaw(implicit p: Parameters) extends Module {
   ram_ptr := req_reg_0.bits.index
   val ram_port = ram(ram_ptr)
 
+  // defaults
+  io.resp.valid := false.B
+
   switch(state) {
     is (sRead) {
       when (req_reg_0.valid) {
@@ -199,6 +203,10 @@ class IfElseRaw(implicit p: Parameters) extends Module {
       // update ram
       ram_ptr := req_reg_1.bits.index
       ram_port := new_val
+
+      // write response
+      io.resp.valid := !reset.toBool
+      io.resp.bits.new_val := new_val
 
       // state transition
       state := sRead
