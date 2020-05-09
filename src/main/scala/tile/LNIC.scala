@@ -65,7 +65,7 @@ object LNICConsts {
   val NIC_IP_ADDR = "h0A000001".U // 10.0.0.1
 
   val MAX_PKTS_PER_MSG = 16
-  val MAX_PKT_LEN_BYTES = 1024
+  val MAX_PKT_LEN_BYTES = 512
 
   // Compute how long to wait b/w sending PULL pkts
   val LINK_RATE_GBPS = 100
@@ -80,8 +80,7 @@ object LNICConsts {
   // TODO(sibanez): what is the expected range of the credit state?
   val CREDIT_BITS = 16
   val TIMER_BITS = 64
-  // TODO(sibanez): define this ...
-  val RTT_PKTS = MAX_PKTS_PER_MSG
+  val RTT_PKTS = 5
 
   // TODO(sibanez): how best to size these queues?
   // This queue only builds up if pkts are being scheduled faster than
@@ -94,7 +93,7 @@ object LNICConsts {
   val MSG_BUFFER_COUNT = LinkedHashMap(64  -> 64,
                                        128 -> 32,
                                        1024 -> 16,
-                                       4096 -> 8)
+                                       8192 -> 8)
   val NUM_MSG_BUFFER_WORDS = MSG_BUFFER_COUNT.map({ case (size: Int, count: Int) => (size/NET_DP_BYTES)*count }).reduce(_ + _)
   val NUM_MSG_BUFFERS = MSG_BUFFER_COUNT.map({ case (size: Int, count: Int) => count }).reduce(_ + _)
 

@@ -97,6 +97,8 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   val toBtx_table = SyncReadMem(NUM_MSG_BUFFERS, UInt(MAX_PKTS_PER_MSG.W))
   // table mapping {tx_msg_id => max pkt offset of the msg}
   val max_tx_pkt_offset_table = SyncReadMem(NUM_MSG_BUFFERS, UInt(PKT_OFFSET_BITS.W))
+  // table mapping {tx_msg_id => num_init_pkts}
+  val num_init_pkts_table = SyncReadMem(NUM_MSG_BUFFERS, UInt(log2Up(MAX_PKTS_PER_MSG + 1).W))
 
   // Queues to schedule delivery of TX pkts
   // TODO(sibanez): these should become a PIFO ideally
@@ -175,7 +177,9 @@ class LNICPacketize(implicit p: Parameters) extends Module {
 
   val tx_msg_id = Wire(UInt(LNIC_MSG_ID_BITS.W))
   tx_msg_id := tx_msg_id_freelist.io.deq.bits // default
+
   val init_toBtx_table_port = toBtx_table(tx_msg_id)
+  val num_init_pkts_wr_port = num_init_pkts_table(tx_msg_id)
 
   switch (enqStates(enq_context)) {
     is (sWaitAppHdr) {
@@ -185,7 +189,6 @@ class LNICPacketize(implicit p: Parameters) extends Module {
         assert (tx_msg_id_freelist.io.deq.valid, "There is an available buffer but not an available tx_msg_id?")
         // read tx_msg_id_freelist
         tx_msg_id_freelist.io.deq.ready := true.B
-        val tx_msg_id = tx_msg_id_freelist.io.deq.bits
         // read from target size class freelist
         val target_size_class = PriorityEncoder(available_classes)
         val target_freelist = size_class_freelists_io(target_size_class)
@@ -212,6 +215,7 @@ class LNICPacketize(implicit p: Parameters) extends Module {
         delivered_table(tx_msg_id) := 0.U 
         credit_table(tx_msg_id) := RTT_PKTS.U
         init_toBtx_table_port := toBtx
+        num_init_pkts_wr_port := 0.U
         // NOTE: we could also initialize max_tx_pkt_offset_table here but that would require
         //   an extra port so we will do that initialization in the dequeue state machine.
         // initialize timer
@@ -243,8 +247,8 @@ class LNICPacketize(implicit p: Parameters) extends Module {
         val is_last_word = ctx_state.rem_bytes <= XBYTES.U
         val is_full_pkt = ctx_state.pkt_bytes + XBYTES.U === MAX_PKT_LEN_BYTES.U
 
-        // TODO(sibanez): should only immediately transmit up to RTT_PKTS, not all pkts
-        when (is_last_word || is_full_pkt) {
+        // only immediately transmit up to RTT_PKTS, not all pkts
+        when ( (is_last_word || is_full_pkt) && (ctx_state.pkt_offset < RTT_PKTS.U)) {
           // schedule pkt for tx
           // TODO(sibanez): this isn't really a bug, this can legit happen, how best to deal with it?
           assert (init_scheduled_pkts_enq.ready, "scheduled_pkts queue is full during enqueue!")
@@ -254,6 +258,8 @@ class LNICPacketize(implicit p: Parameters) extends Module {
           tx_msg_id := ctx_state.msg_desc.tx_msg_id
           init_toBtx_table_port := ctx_state.toBtx ^ tx_pkt_desc.tx_pkts
           ctx_state.toBtx := ctx_state.toBtx ^ tx_pkt_desc.tx_pkts
+          // mark pkt as initialized (and hence available for dequeue logic to transmit)
+          num_init_pkts_wr_port := ctx_state.pkt_offset + 1.U
         }
 
         when (is_full_pkt) {
@@ -318,8 +324,10 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   val init_max_pkt_offset_reg = RegInit(false.B)
 
   val deq_tx_msg_id = Wire(UInt(LNIC_MSG_ID_BITS.W))
-  val update_max_tx_pkt_offset_port = max_tx_pkt_offset_table(deq_tx_msg_id)
   deq_tx_msg_id := active_tx_desc_reg.msg_desc.tx_msg_id
+
+  val update_max_tx_pkt_offset_port = max_tx_pkt_offset_table(deq_tx_msg_id)
+  val num_init_pkts_rd_port = num_init_pkts_table(deq_tx_msg_id)
 
   // defaults
   io.net_out.valid     := false.B
@@ -338,8 +346,8 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   io.meta_out.bits.buf_size_class := active_tx_desc_reg.msg_desc.size_class
   io.meta_out.bits.pull_offset    := 0.U
   io.meta_out.bits.genACK         := false.B
-  io.meta_out.bits.genNACK         := false.B
-  io.meta_out.bits.genPULL         := false.B
+  io.meta_out.bits.genNACK        := false.B
+  io.meta_out.bits.genPULL        := false.B
 
   switch (deqState) {
     is (sWaitTxPkts) {
@@ -372,39 +380,49 @@ class LNICPacketize(implicit p: Parameters) extends Module {
       }
     }
     is (sSendTxPkts) {
-      io.net_out.valid := !(reset.toBool) // do not assert valid on reset
-      val is_last_word = deq_pkt_rem_bytes_reg <= NET_DP_BYTES.U
-      io.net_out.bits.keep := Mux(is_last_word,
-                                  (1.U << deq_pkt_rem_bytes_reg) - 1.U,
-                                  NET_DP_FULL_KEEP)
-      io.net_out.bits.last := is_last_word
+      // Get num_init_pkts read result
+      val num_init_pkts = Wire(UInt())
+      num_init_pkts := num_init_pkts_rd_port
 
-      // wait for no backpressure
-      when (io.net_out.ready) {
-        when (is_last_word) {
-          when (active_tx_desc_reg.tx_pkts === 0.U) {
-            // no more pkts to transmit
-            deqState := sWaitTxPkts
+      // only tx the current pkt if it has been initialized (i.e. written by CPU)
+      when (deq_pkt_offset_reg < num_init_pkts) {
+        io.net_out.valid := !(reset.toBool) // do not assert valid on reset
+        val is_last_word = deq_pkt_rem_bytes_reg <= NET_DP_BYTES.U
+        io.net_out.bits.keep := Mux(is_last_word,
+                                    (1.U << deq_pkt_rem_bytes_reg) - 1.U,
+                                    NET_DP_FULL_KEEP)
+        io.net_out.bits.last := is_last_word
+  
+        // wait for no backpressure
+        when (io.net_out.ready) {
+          when (is_last_word) {
+            when (active_tx_desc_reg.tx_pkts === 0.U) {
+              // no more pkts to transmit
+              deqState := sWaitTxPkts
+            } .otherwise {
+              // there are more pkts to transmit
+              tx_next_pkt(active_tx_desc_reg)
+            }
           } .otherwise {
-            // there are more pkts to transmit
-            tx_next_pkt(active_tx_desc_reg)
+            // start reading the next word
+            deq_buf_ptr := deq_buf_ptr_reg + 1.U
+            deq_buf_ptr_reg := deq_buf_ptr
+            // update deq_pkt_rem_bytes_reg
+            deq_pkt_rem_bytes_reg := deq_pkt_rem_bytes_reg - NET_DP_BYTES.U
+            // no longer the first word
+            is_first_word_reg := false.B
           }
-        } .otherwise {
-          // start reading the next word
-          deq_buf_ptr := deq_buf_ptr_reg + 1.U
-          deq_buf_ptr_reg := deq_buf_ptr
-          // update deq_pkt_rem_bytes_reg
-          deq_pkt_rem_bytes_reg := deq_pkt_rem_bytes_reg - NET_DP_BYTES.U
-          // no longer the first word
-          is_first_word_reg := false.B
         }
-      }
-
-      // update max_tx_pkt_offset state
-      val cur_max_pkt_offset = Wire(UInt(PKT_OFFSET_BITS.W))
-      cur_max_pkt_offset := update_max_tx_pkt_offset_port
-      when (init_max_pkt_offset_reg || deq_pkt_offset_reg > cur_max_pkt_offset) {
-        update_max_tx_pkt_offset_port := deq_pkt_offset_reg
+  
+        // update max_tx_pkt_offset state
+        val cur_max_pkt_offset = Wire(UInt(PKT_OFFSET_BITS.W))
+        cur_max_pkt_offset := update_max_tx_pkt_offset_port
+        when (init_max_pkt_offset_reg || deq_pkt_offset_reg > cur_max_pkt_offset) {
+          update_max_tx_pkt_offset_port := deq_pkt_offset_reg
+        }
+      } .otherwise {
+        // no more pkts available to transmit
+        deqState := sWaitTxPkts
       }
 
     }
@@ -416,6 +434,7 @@ class LNICPacketize(implicit p: Parameters) extends Module {
     deq_pkt_offset_reg := pkt_offset
     // find the word offset from the buf_ptr: pkt_offset*words_per_mtu
     require(isPow2(MAX_PKT_LEN_BYTES), "MAX_PKT_LEN_BYTES must be a power of 2!")
+    require(MAX_PKT_LEN_BYTES >= 64, "MAX_PKT_LEN_BYTES must be at least 64!")
     val word_offset = pkt_offset << (log2Up(MAX_PKT_LEN_BYTES/NET_DP_BYTES)).U
     // start reading the first word of the pkt
     deq_buf_ptr := descriptor.msg_desc.buf_ptr + word_offset

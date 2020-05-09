@@ -117,7 +117,7 @@ class LNICTimers(implicit p: Parameters) extends Module {
           // get read result
           val cur_timer_entry = Wire(new TimerEntry)
           cur_timer_entry := timer_rw_port
-          when (cur_timer_entry.valid && cur_timer_entry.timeout_val >= now) {
+          when (cur_timer_entry.valid && now >= cur_timer_entry.timeout_val) {
             // fire timeout event
             io.timeout.valid := true.B
             io.timeout.bits.msg_id := cur_timer_id
