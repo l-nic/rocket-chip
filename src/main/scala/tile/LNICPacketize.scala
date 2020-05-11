@@ -65,7 +65,6 @@ class ContextEnqState extends Bundle {
   val rem_bytes  = UInt(MSG_LEN_BITS.W)
   val pkt_bytes  = UInt(16.W)
   val word_count = UInt(16.W)
-  val toBtx      = UInt(MAX_PKTS_PER_MSG.W)
 }
 
 @chiselName
@@ -97,8 +96,6 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   val toBtx_table = SyncReadMem(NUM_MSG_BUFFERS, UInt(MAX_PKTS_PER_MSG.W))
   // table mapping {tx_msg_id => max pkt offset of the msg}
   val max_tx_pkt_offset_table = SyncReadMem(NUM_MSG_BUFFERS, UInt(PKT_OFFSET_BITS.W))
-  // table mapping {tx_msg_id => num_init_pkts}
-  val num_init_pkts_table = SyncReadMem(NUM_MSG_BUFFERS, UInt(log2Up(MAX_PKTS_PER_MSG + 1).W))
 
   // Queues to schedule delivery of TX pkts
   // TODO(sibanez): these should become a PIFO ideally
@@ -178,8 +175,8 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   val tx_msg_id = Wire(UInt(LNIC_MSG_ID_BITS.W))
   tx_msg_id := tx_msg_id_freelist.io.deq.bits // default
 
+  val init_credit_table_port = credit_table(tx_msg_id)
   val init_toBtx_table_port = toBtx_table(tx_msg_id)
-  val num_init_pkts_wr_port = num_init_pkts_table(tx_msg_id)
 
   switch (enqStates(enq_context)) {
     is (sWaitAppHdr) {
@@ -209,13 +206,10 @@ class LNICPacketize(implicit p: Parameters) extends Module {
         ctx_state.pkt_bytes := 0.U
         ctx_state.word_count := 0.U // counts the number of words written by CPU for this msg (not including app hdr)
         val num_pkts = MsgBufHelpers.compute_num_pkts(tx_app_hdr.msg_len)
-        val toBtx = (1.U << num_pkts) - 1.U // every pkt must be transmitted
-        ctx_state.toBtx := toBtx
         // initialize state that is indexed by tx_msg_id (for transport support)
         delivered_table(tx_msg_id) := 0.U 
-        credit_table(tx_msg_id) := RTT_PKTS.U
-        init_toBtx_table_port := toBtx
-        num_init_pkts_wr_port := 0.U
+        init_credit_table_port := RTT_PKTS.U
+        init_toBtx_table_port := 0.U // no pkts have been written yet
         // NOTE: we could also initialize max_tx_pkt_offset_table here but that would require
         //   an extra port so we will do that initialization in the dequeue state machine.
         // initialize timer
@@ -247,20 +241,34 @@ class LNICPacketize(implicit p: Parameters) extends Module {
         val is_last_word = ctx_state.rem_bytes <= XBYTES.U
         val is_full_pkt = ctx_state.pkt_bytes + XBYTES.U === MAX_PKT_LEN_BYTES.U
 
+        tx_msg_id := ctx_state.msg_desc.tx_msg_id
+
+        // TODO(sibanez): this part is kinda sketchy - read result doesn't show up until the cycle after
+        //   driving the address line (tx_msg_id). So if there are context switches b/w threads
+        //   this may read the wrong values?
+        // get credit state read result
+        val enq_credit = Wire(UInt(CREDIT_BITS.W))
+        enq_credit := init_credit_table_port
+        // get toBtx state read result
+        val enq_toBtx = Wire(UInt(MAX_PKTS_PER_MSG.W))
+        enq_toBtx := init_toBtx_table_port
+        // NOTES:
+        //   - We want to read the current value of toBtx here because if a pkt was dropped, we want to
+        //     make sure that bit stays set.
+        //   - We want to read the current value of credit here because if the credit increases quickly
+        //     (i.e. PULL arrives quickly or pkts are written slowly) then more pkts can be sent immediately.
+
         when (is_last_word || is_full_pkt) {
-          tx_msg_id := ctx_state.msg_desc.tx_msg_id
-          // mark pkt as initialized (and hence available for dequeue logic to transmit)
-          num_init_pkts_wr_port := ctx_state.pkt_offset + 1.U
           // only immediately transmit up to RTT_PKTS, not all pkts
-          when (ctx_state.pkt_offset < RTT_PKTS.U) {
+          when (ctx_state.pkt_offset < enq_credit) {
             // schedule pkt for tx
             // TODO(sibanez): this isn't really a bug, this can legit happen, how best to deal with it?
             assert (init_scheduled_pkts_enq.ready, "scheduled_pkts queue is full during enqueue!")
             init_scheduled_pkts_enq.valid := true.B
             init_scheduled_pkts_enq.bits := tx_pkt_desc
-            // mark pkt as no longer needing transmission
-            init_toBtx_table_port := ctx_state.toBtx ^ tx_pkt_desc.tx_pkts
-            ctx_state.toBtx := ctx_state.toBtx ^ tx_pkt_desc.tx_pkts
+          } .otherwise {
+            // mark pkt as in need of transmission via credit events
+            init_toBtx_table_port := enq_toBtx | tx_pkt_desc.tx_pkts            
           }
         }
 
@@ -329,7 +337,6 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   deq_tx_msg_id := active_tx_desc_reg.msg_desc.tx_msg_id
 
   val update_max_tx_pkt_offset_port = max_tx_pkt_offset_table(deq_tx_msg_id)
-  val num_init_pkts_rd_port = num_init_pkts_table(deq_tx_msg_id)
 
   // defaults
   io.net_out.valid     := false.B
@@ -382,49 +389,39 @@ class LNICPacketize(implicit p: Parameters) extends Module {
       }
     }
     is (sSendTxPkts) {
-      // Get num_init_pkts read result
-      val num_init_pkts = Wire(UInt())
-      num_init_pkts := num_init_pkts_rd_port
-
-      // only tx the current pkt if it has been initialized (i.e. written by CPU)
-      when (deq_pkt_offset_reg < num_init_pkts) {
-        io.net_out.valid := !(reset.toBool) // do not assert valid on reset
-        val is_last_word = deq_pkt_rem_bytes_reg <= NET_DP_BYTES.U
-        io.net_out.bits.keep := Mux(is_last_word,
-                                    (1.U << deq_pkt_rem_bytes_reg) - 1.U,
-                                    NET_DP_FULL_KEEP)
-        io.net_out.bits.last := is_last_word
+      io.net_out.valid := !(reset.toBool) // do not assert valid on reset
+      val is_last_word = deq_pkt_rem_bytes_reg <= NET_DP_BYTES.U
+      io.net_out.bits.keep := Mux(is_last_word,
+                                  (1.U << deq_pkt_rem_bytes_reg) - 1.U,
+                                  NET_DP_FULL_KEEP)
+      io.net_out.bits.last := is_last_word
   
-        // wait for no backpressure
-        when (io.net_out.ready) {
-          when (is_last_word) {
-            when (active_tx_desc_reg.tx_pkts === 0.U) {
-              // no more pkts to transmit
-              deqState := sWaitTxPkts
-            } .otherwise {
-              // there are more pkts to transmit
-              tx_next_pkt(active_tx_desc_reg)
-            }
+      // wait for no backpressure
+      when (io.net_out.ready) {
+        when (is_last_word) {
+          when (active_tx_desc_reg.tx_pkts === 0.U) {
+            // no more pkts to transmit
+            deqState := sWaitTxPkts
           } .otherwise {
-            // start reading the next word
-            deq_buf_ptr := deq_buf_ptr_reg + 1.U
-            deq_buf_ptr_reg := deq_buf_ptr
-            // update deq_pkt_rem_bytes_reg
-            deq_pkt_rem_bytes_reg := deq_pkt_rem_bytes_reg - NET_DP_BYTES.U
-            // no longer the first word
-            is_first_word_reg := false.B
+            // there are more pkts to transmit
+            tx_next_pkt(active_tx_desc_reg)
           }
+        } .otherwise {
+          // start reading the next word
+          deq_buf_ptr := deq_buf_ptr_reg + 1.U
+          deq_buf_ptr_reg := deq_buf_ptr
+          // update deq_pkt_rem_bytes_reg
+          deq_pkt_rem_bytes_reg := deq_pkt_rem_bytes_reg - NET_DP_BYTES.U
+          // no longer the first word
+          is_first_word_reg := false.B
         }
+      }
   
-        // update max_tx_pkt_offset state
-        val cur_max_pkt_offset = Wire(UInt(PKT_OFFSET_BITS.W))
-        cur_max_pkt_offset := update_max_tx_pkt_offset_port
-        when (init_max_pkt_offset_reg || deq_pkt_offset_reg > cur_max_pkt_offset) {
-          update_max_tx_pkt_offset_port := deq_pkt_offset_reg
-        }
-      } .otherwise {
-        // no more pkts available to transmit
-        deqState := sWaitTxPkts
+      // update max_tx_pkt_offset state
+      val cur_max_pkt_offset = Wire(UInt(PKT_OFFSET_BITS.W))
+      cur_max_pkt_offset := update_max_tx_pkt_offset_port
+      when (init_max_pkt_offset_reg || deq_pkt_offset_reg > cur_max_pkt_offset) {
+        update_max_tx_pkt_offset_port := deq_pkt_offset_reg
       }
 
     }
@@ -570,9 +567,10 @@ class LNICPacketize(implicit p: Parameters) extends Module {
       toBtx := update_toBtx_table_port
 
       // update toBtx with rtx pkt
-      val rtx_toBtx = Mux(creditToBtx_reg_1.bits.rtx,
-                          toBtx | (1.U << creditToBtx_reg_1.bits.rtx_pkt_offset),
-                          toBtx)
+      val rtx_toBtx = Wire(UInt(MAX_PKTS_PER_MSG.W))
+      rtx_toBtx := Mux(creditToBtx_reg_1.bits.rtx,
+                       toBtx | (1.U << creditToBtx_reg_1.bits.rtx_pkt_offset),
+                       toBtx)
 
       // compute updated credit and toBtx state
       val new_credit = Wire(UInt(CREDIT_BITS.W))
@@ -580,10 +578,11 @@ class LNICPacketize(implicit p: Parameters) extends Module {
       when (creditToBtx_reg_1.bits.update_credit) {
         new_credit := creditToBtx_reg_1.bits.new_credit
         // compute pkts to transmit
-        val tx_pkts = rtx_toBtx & ((1.U << new_credit) - 1.U)
+        val credit_tx_pkts = Wire(UInt(MAX_PKTS_PER_MSG.W))
+        credit_tx_pkts := rtx_toBtx & ((1.U << new_credit) - 1.U)
         // clear bits of pkts to be transmitted
-        new_toBtx := rtx_toBtx ^ tx_pkts
-        when (tx_pkts =/= 0.U) {
+        new_toBtx := rtx_toBtx & ~credit_tx_pkts
+        when (credit_tx_pkts =/= 0.U) {
           // there are pkts to transmit
           val tx_pkt_desc = Wire(new TxPktDescriptor)
           tx_pkt_desc.msg_desc.tx_msg_id              := creditToBtx_reg_1.bits.tx_msg_id
@@ -593,7 +592,7 @@ class LNICPacketize(implicit p: Parameters) extends Module {
           tx_pkt_desc.msg_desc.tx_app_hdr.dst_context := creditToBtx_reg_1.bits.dst_context
           tx_pkt_desc.msg_desc.tx_app_hdr.msg_len     := creditToBtx_reg_1.bits.msg_len
           tx_pkt_desc.msg_desc.src_context            := creditToBtx_reg_1.bits.src_context
-          tx_pkt_desc.tx_pkts                := tx_pkts
+          tx_pkt_desc.tx_pkts                := credit_tx_pkts
           // TODO(sibanez): this is not really a bug, it can legit happen, how to handle?
           assert(credit_scheduled_pkts_enq.ready, "scheduled_pkts queue is full while scheduling a packet!")
           credit_scheduled_pkts_enq.valid := true.B
