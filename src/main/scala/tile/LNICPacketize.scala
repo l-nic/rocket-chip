@@ -247,19 +247,21 @@ class LNICPacketize(implicit p: Parameters) extends Module {
         val is_last_word = ctx_state.rem_bytes <= XBYTES.U
         val is_full_pkt = ctx_state.pkt_bytes + XBYTES.U === MAX_PKT_LEN_BYTES.U
 
-        // only immediately transmit up to RTT_PKTS, not all pkts
-        when ( (is_last_word || is_full_pkt) && (ctx_state.pkt_offset < RTT_PKTS.U)) {
-          // schedule pkt for tx
-          // TODO(sibanez): this isn't really a bug, this can legit happen, how best to deal with it?
-          assert (init_scheduled_pkts_enq.ready, "scheduled_pkts queue is full during enqueue!")
-          init_scheduled_pkts_enq.valid := true.B
-          init_scheduled_pkts_enq.bits := tx_pkt_desc
-          // mark pkt as no longer needing transmission
+        when (is_last_word || is_full_pkt) {
           tx_msg_id := ctx_state.msg_desc.tx_msg_id
-          init_toBtx_table_port := ctx_state.toBtx ^ tx_pkt_desc.tx_pkts
-          ctx_state.toBtx := ctx_state.toBtx ^ tx_pkt_desc.tx_pkts
           // mark pkt as initialized (and hence available for dequeue logic to transmit)
           num_init_pkts_wr_port := ctx_state.pkt_offset + 1.U
+          // only immediately transmit up to RTT_PKTS, not all pkts
+          when (ctx_state.pkt_offset < RTT_PKTS.U) {
+            // schedule pkt for tx
+            // TODO(sibanez): this isn't really a bug, this can legit happen, how best to deal with it?
+            assert (init_scheduled_pkts_enq.ready, "scheduled_pkts queue is full during enqueue!")
+            init_scheduled_pkts_enq.valid := true.B
+            init_scheduled_pkts_enq.bits := tx_pkt_desc
+            // mark pkt as no longer needing transmission
+            init_toBtx_table_port := ctx_state.toBtx ^ tx_pkt_desc.tx_pkts
+            ctx_state.toBtx := ctx_state.toBtx ^ tx_pkt_desc.tx_pkts
+          }
         }
 
         when (is_full_pkt) {
