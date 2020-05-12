@@ -149,8 +149,18 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   // need one state per context
   val enqStates = RegInit(VecInit(Seq.fill(num_contexts)(sWaitAppHdr)))
 
+  // NOTE: register the ID of the last context that enqueued a word. We do this cuz
+  //   we want to continuously read the credit and toBtx state.
+  val enq_context_reg = Reg(UInt(LNIC_CONTEXT_BITS.W))
+  when (io.net_in.valid) {
+    enq_context_reg := io.net_in.bits.src_context
+  }
+
   // defaults
-  val enq_context = io.net_in.bits.src_context
+  val enq_context = Wire(UInt(LNIC_CONTEXT_BITS.W))
+  enq_context := Mux(io.net_in.valid,
+                     io.net_in.bits.src_context,
+                     enq_context_reg)
   io.net_in.ready := true.B
   init_scheduled_pkts_enq.valid := false.B
   io.schedule.valid := false.B
@@ -223,9 +233,10 @@ class LNICPacketize(implicit p: Parameters) extends Module {
       }
     }
     is (sWriteMsg) {
+      val ctx_state = context_enq_state(enq_context)
+      tx_msg_id := ctx_state.msg_desc.tx_msg_id
       // wait for a MsgWord to arrive
       when (io.net_in.valid) {
-        val ctx_state = context_enq_state(enq_context)
         // compute where to write MsgWord in the buffer
         val word_offset_bits = log2Up(NET_DP_BITS/XLEN)
         val word_offset = ctx_state.word_count(word_offset_bits-1, 0)
@@ -240,8 +251,6 @@ class LNICPacketize(implicit p: Parameters) extends Module {
 
         val is_last_word = ctx_state.rem_bytes <= XBYTES.U
         val is_full_pkt = ctx_state.pkt_bytes + XBYTES.U === MAX_PKT_LEN_BYTES.U
-
-        tx_msg_id := ctx_state.msg_desc.tx_msg_id
 
         // TODO(sibanez): this part is kinda sketchy - read result doesn't show up until the cycle after
         //   driving the address line (tx_msg_id). So if there are context switches b/w threads
