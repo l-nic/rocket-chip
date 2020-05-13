@@ -119,6 +119,8 @@ class SDNetIngressWrapper extends BlackBox with HasBlackBoxResource {
     val reset = Input(Bool())
     val net = new LNICPISAIngressIO
   })
+
+  addResource("/vsrc/SDNetIngressWrapper.sv")
 }
 
 /* Egress Pipeline Blackbox */
@@ -128,6 +130,8 @@ class SDNetEgressWrapper extends BlackBox with HasBlackBoxResource {
     val reset = Input(Bool())
     val net = new LNICPISAEgressIO
   })
+
+  addResource("/vsrc/SDNetEgressWrapper.sv")
 }
 
 /* IfElseRawReg Extern */
