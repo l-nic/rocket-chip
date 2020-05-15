@@ -3,8 +3,7 @@ package freechips.rocketchip.tile
 
 import Chisel._
 
-import chisel3.{VecInit}
-import chisel3.SyncReadMem
+import chisel3.{VecInit, SyncReadMem}
 import chisel3.experimental._
 import freechips.rocketchip.config._
 import freechips.rocketchip.subsystem._
@@ -63,6 +62,7 @@ class RxAppHdr extends Bundle {
 // the info to deliver the indicated msg to the CPU.
 class RxMsgDescriptor extends Bundle {
   val rx_msg_id = UInt(LNIC_MSG_ID_BITS.W)
+  val tx_msg_id = UInt(LNIC_MSG_ID_BITS.W)
   val size_class = UInt(SIZE_CLASS_BITS.W)
   val buf_ptr = UInt(BUF_PTR_BITS.W)
   val dst_context = UInt(LNIC_CONTEXT_BITS.W)
@@ -79,12 +79,21 @@ class LNICAssemble(implicit p: Parameters) extends Module {
   val rx_msg_id_freelist = Module(new FreeList(rx_msg_ids))
   // table mapping unique msg identifier to rx_msg_id
   // TODO(sibanez): this should eventually turn into a D-left exact-match table
-  val rx_msg_id_table = SyncReadMem(NUM_MSG_BUFFERS, new RxMsgIdTableEntry())
+  val rx_msg_id_table = Module(new TrueDualPortRAM((new RxMsgIdTableEntry).getWidth, NUM_MSG_BUFFERS))
+  rx_msg_id_table.io.clock := clock
+  rx_msg_id_table.io.reset := reset
+  rx_msg_id_table.io.portA.we := false.B
+  rx_msg_id_table.io.portB.we := false.B
+
   // RAM used to store msgs while they are being reassembled and delivered to the CPU.
   //   Msgs are stored in words that are the same size as the datapath width.
   val msg_buffer_ram = SyncReadMem(NUM_MSG_BUFFER_WORDS, UInt(NET_DP_BITS.W))
   // table mapping {rx_msg_id => received_bitmap}
-  val received_table = SyncReadMem(NUM_MSG_BUFFERS, UInt(MAX_PKTS_PER_MSG.W))
+  val received_table = Module(new TrueDualPortRAM(MAX_PKTS_PER_MSG, NUM_MSG_BUFFERS))
+  received_table.io.clock := clock
+  received_table.io.reset := reset
+  received_table.io.portA.we := false.B
+  received_table.io.portB.we := false.B
   // table mapping {rx_msg_id => buffer info}
   val buf_info_table = SyncReadMem(NUM_MSG_BUFFERS, new BufInfoTableEntry())
 
@@ -136,16 +145,17 @@ class LNICAssemble(implicit p: Parameters) extends Module {
   // TODO(sibanez): update msg_key to include src_ip and src_context,
   //   which requires rx_msg_id_table to become a D-left lookup table.
   val msg_key = Wire(UInt())
-  val rx_msg_id_table_port = rx_msg_id_table(msg_key)
+  val msg_key_reg = RegNext(msg_key)
   val cur_rx_msg_id_table_entry = Wire(new RxMsgIdTableEntry())
 
   // defaults
   msg_key := get_rx_msg_info_req_reg.bits.tx_msg_id
+  rx_msg_id_table.io.portA.addr := msg_key
   io.get_rx_msg_info.resp.valid := false.B
 
-  // memory initialization
+  // Initialize rx_msg_id_table so that all entries are invalid
   val init_done_reg = RegInit(false.B)
-  MemHelpers.memory_init(rx_msg_id_table_port, msg_key, NUM_MSG_BUFFERS, (new RxMsgIdTableEntry).fromBits(0.U), init_done_reg)
+  MemHelpers.memory_init(rx_msg_id_table.io.portA, NUM_MSG_BUFFERS, 0.U, init_done_reg)
 
   // True if both an rx_msg_id and buffer are available for this msg
   val allocation_success_reg = RegInit(false.B)
@@ -175,7 +185,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
       // return extern call response
       io.get_rx_msg_info.resp.valid := !(reset.toBool)
       // Get result of reading the rx_msg_id_table
-      cur_rx_msg_id_table_entry := rx_msg_id_table_port
+      cur_rx_msg_id_table_entry := (new RxMsgIdTableEntry).fromBits(rx_msg_id_table.io.portA.dout)
       when (cur_rx_msg_id_table_entry.valid) {
         // This msg has already been allocated an rx_msg_id
         io.get_rx_msg_info.resp.bits.fail := false.B
@@ -194,7 +204,9 @@ class LNICAssemble(implicit p: Parameters) extends Module {
         val new_rx_msg_id_table_entry = Wire(new RxMsgIdTableEntry())
         new_rx_msg_id_table_entry.valid := true.B
         new_rx_msg_id_table_entry.rx_msg_id := rx_msg_id
-        rx_msg_id_table_port := new_rx_msg_id_table_entry
+        rx_msg_id_table.io.portA.addr := msg_key_reg
+        rx_msg_id_table.io.portA.we := true.B
+        rx_msg_id_table.io.portA.din := new_rx_msg_id_table_entry.asUInt
         // update buf_info_table
         val target_freelist = size_class_freelists_io(size_class_reg)
         target_freelist.deq.ready := true.B // read from freelist
@@ -204,7 +216,9 @@ class LNICAssemble(implicit p: Parameters) extends Module {
         new_buf_info_table_entry.size_class := size_class_reg
         buf_info_table(rx_msg_id) := new_buf_info_table_entry
         // update received_table
-        received_table(rx_msg_id) := 0.U
+        received_table.io.portA.addr := rx_msg_id
+        received_table.io.portA.we := true.B
+        received_table.io.portA.din := 0.U
       } .otherwise {
         // This is a new msg and we cannot allocate a buffer and rx_msg_id
         io.get_rx_msg_info.resp.bits.fail := true.B
@@ -251,8 +265,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
   val enq_buf_info_table_port = buf_info_table(enq_rx_msg_id)
   val buf_info = Wire(new BufInfoTableEntry())
   val buf_info_reg = Reg(new BufInfoTableEntry())
-  // received_table read/write port
-  val enq_received_table_port = received_table(enq_rx_msg_id)
+  // received_table read result
   val enq_received = Wire(UInt(MAX_PKTS_PER_MSG.W))
   // msg_buffer_ram write port
   val pkt_word_ptr = Wire(UInt(BUF_PTR_BITS.W))
@@ -264,6 +277,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
   // defaults
   io.net_in.ready := true.B
   enq_rx_msg_id := io.meta_in.bits.rx_msg_id
+  received_table.io.portB.addr := enq_rx_msg_id
   scheduled_msgs_enq.valid := false.B
 
   switch (stateEnq) {
@@ -287,12 +301,16 @@ class LNICAssemble(implicit p: Parameters) extends Module {
         enq_msg_buffer_ram_port := io.net_in.bits.data
         pkt_word_count := 1.U
         // mark pkt as received
-        enq_received := enq_received_table_port
-        val new_enq_received = enq_received | (1.U << io.meta_in.bits.pkt_offset)
-        enq_received_table_port := new_enq_received
+        enq_received := received_table.io.portB.dout
+        val new_enq_received = Wire(UInt(MAX_PKTS_PER_MSG.W))
+        new_enq_received := enq_received | (1.U << io.meta_in.bits.pkt_offset)
+        received_table.io.portB.we := !reset.toBool
+        received_table.io.portB.din := new_enq_received
         // check if the whole msg has been received
         val num_pkts = MsgBufHelpers.compute_num_pkts(io.meta_in.bits.msg_len)
-        val msg_complete = (new_enq_received === (1.U << num_pkts) - 1.U)
+        val all_pkts = Wire(UInt(MAX_PKTS_PER_MSG.W))
+        all_pkts := (1.U << num_pkts) - 1.U
+        val msg_complete = (new_enq_received === all_pkts)
         msg_complete_reg := msg_complete
         // state transition
         when (io.net_in.bits.last) {
@@ -301,6 +319,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
                 // schedule msg for delivery to the CPU
                 schedule_msg(meta_in_bits_reg.dst_context,
                              meta_in_bits_reg.rx_msg_id,
+                             meta_in_bits_reg.tx_msg_id,
                              buf_info.buf_ptr,
                              buf_info.size_class,
                              meta_in_bits_reg.src_ip,
@@ -328,6 +347,7 @@ class LNICAssemble(implicit p: Parameters) extends Module {
                     // schedule msg for delivery to the CPU
                     schedule_msg(meta_in_bits_reg.dst_context,
                                  meta_in_bits_reg.rx_msg_id,
+                                 meta_in_bits_reg.tx_msg_id,
                                  buf_info_reg.buf_ptr,
                                  buf_info_reg.size_class,
                                  meta_in_bits_reg.src_ip,
@@ -344,12 +364,13 @@ class LNICAssemble(implicit p: Parameters) extends Module {
     pkt_ptr
   }
 
-  def schedule_msg(dst_context: UInt, rx_msg_id: UInt, buf_ptr: UInt, size_class: UInt, src_ip: UInt, src_context: UInt, msg_len: UInt) = {
+  def schedule_msg(dst_context: UInt, rx_msg_id: UInt, tx_msg_id: UInt, buf_ptr: UInt, size_class: UInt, src_ip: UInt, src_context: UInt, msg_len: UInt) = {
     // TODO(sibanez): this should be inserting into a PIFO or per-context queues rather than
     //   a single fifo queue. This is just a temporary simplification.
     assert (scheduled_msgs_enq.ready, "scheduled_msgs FIFO is full when trying to schedule a msg")
     scheduled_msgs_enq.valid := true.B
     scheduled_msgs_enq.bits.rx_msg_id := rx_msg_id
+    scheduled_msgs_enq.bits.tx_msg_id := tx_msg_id
     scheduled_msgs_enq.bits.size_class := size_class
     scheduled_msgs_enq.bits.buf_ptr := buf_ptr
     scheduled_msgs_enq.bits.dst_context := dst_context
@@ -450,6 +471,11 @@ class LNICAssemble(implicit p: Parameters) extends Module {
           val target_buf_freelist_io = size_class_freelists_io(msg_desc_reg.size_class)
           target_buf_freelist_io.enq.valid := true.B
           target_buf_freelist_io.enq.bits := msg_desc_reg.buf_ptr
+          // mark the corresponding entry in rx_msg_id_table as invalid
+          // TODO(sibanez): this will eventually turn into a D-left table ...
+          rx_msg_id_table.io.portB.addr := msg_desc_reg.tx_msg_id
+          rx_msg_id_table.io.portB.we   := true.B
+          rx_msg_id_table.io.portB.din  := 0.U
         }
       } .otherwise {
         // stay at the same word

@@ -59,6 +59,7 @@ module SDNetIngressWrapper #(
   output              [7:0] net_meta_out_bits_pkt_offset,
   output             [15:0] net_meta_out_bits_dst_context,
   output             [15:0] net_meta_out_bits_rx_msg_id,
+  output             [15:0] net_meta_out_bits_tx_msg_id,
 
   /* IO for get_rx_msg_info */
   output                    net_get_rx_msg_info_req_valid,
@@ -159,7 +160,8 @@ module SDNetIngressWrapper #(
           net_meta_out_bits_msg_len,
           net_meta_out_bits_pkt_offset,
           net_meta_out_bits_dst_context,
-          net_meta_out_bits_rx_msg_id} = user_metadata_out;
+          net_meta_out_bits_rx_msg_id,
+          net_meta_out_bits_tx_msg_id} = user_metadata_out;
 
   /* get_rx_msg_info extern */
   assign net_get_rx_msg_info_req_valid = user_extern_out_valid.get_rx_msg_info;

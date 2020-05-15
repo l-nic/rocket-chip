@@ -23,6 +23,7 @@ class PISAIngressMetaOut extends Bundle {
   val pkt_offset   = UInt(PKT_OFFSET_BITS.W)
   val dst_context  = UInt(LNIC_CONTEXT_BITS.W)
   val rx_msg_id    = UInt(LNIC_MSG_ID_BITS.W)
+  val tx_msg_id    = UInt(LNIC_MSG_ID_BITS.W)
 }
 
 class PISAEgressMetaIn extends Bundle {

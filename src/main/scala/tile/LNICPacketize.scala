@@ -91,9 +91,17 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   // table mapping {tx_msg_id => delivered_bitmap}
   val delivered_table = SyncReadMem(NUM_MSG_BUFFERS, UInt(MAX_PKTS_PER_MSG.W))
   // table mapping {tx_msg_id => credit}
-  val credit_table = SyncReadMem(NUM_MSG_BUFFERS, UInt(CREDIT_BITS.W))
+  val credit_table = Module(new TrueDualPortRAM(CREDIT_BITS, NUM_MSG_BUFFERS))
+  credit_table.io.clock := clock
+  credit_table.io.reset := reset
+  credit_table.io.portA.we := false.B
+  credit_table.io.portB.we := false.B
   // table mapping {tx_msg_id => toBtx_bitmap}
-  val toBtx_table = SyncReadMem(NUM_MSG_BUFFERS, UInt(MAX_PKTS_PER_MSG.W))
+  val toBtx_table = Module(new TrueDualPortRAM(MAX_PKTS_PER_MSG, NUM_MSG_BUFFERS))
+  toBtx_table.io.clock := clock
+  toBtx_table.io.reset := reset
+  toBtx_table.io.portA.we := false.B
+  toBtx_table.io.portB.we := false.B
   // table mapping {tx_msg_id => max pkt offset of the msg}
   val max_tx_pkt_offset_table = SyncReadMem(NUM_MSG_BUFFERS, UInt(PKT_OFFSET_BITS.W))
 
@@ -185,8 +193,8 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   val tx_msg_id = Wire(UInt(LNIC_MSG_ID_BITS.W))
   tx_msg_id := tx_msg_id_freelist.io.deq.bits // default
 
-  val init_credit_table_port = credit_table(tx_msg_id)
-  val init_toBtx_table_port = toBtx_table(tx_msg_id)
+  credit_table.io.portA.addr := tx_msg_id
+  toBtx_table.io.portA.addr := tx_msg_id
 
   switch (enqStates(enq_context)) {
     is (sWaitAppHdr) {
@@ -218,8 +226,10 @@ class LNICPacketize(implicit p: Parameters) extends Module {
         val num_pkts = MsgBufHelpers.compute_num_pkts(tx_app_hdr.msg_len)
         // initialize state that is indexed by tx_msg_id (for transport support)
         delivered_table(tx_msg_id) := 0.U 
-        init_credit_table_port := RTT_PKTS.U
-        init_toBtx_table_port := 0.U // no pkts have been written yet
+        credit_table.io.portA.we := true.B
+        credit_table.io.portA.din := RTT_PKTS.U
+        toBtx_table.io.portA.we := true.B
+        toBtx_table.io.portA.din := 0.U // no pkts have been written yet
         // NOTE: we could also initialize max_tx_pkt_offset_table here but that would require
         //   an extra port so we will do that initialization in the dequeue state machine.
         // initialize timer
@@ -257,10 +267,10 @@ class LNICPacketize(implicit p: Parameters) extends Module {
         //   this may read the wrong values?
         // get credit state read result
         val enq_credit = Wire(UInt(CREDIT_BITS.W))
-        enq_credit := init_credit_table_port
+        enq_credit := credit_table.io.portA.dout
         // get toBtx state read result
         val enq_toBtx = Wire(UInt(MAX_PKTS_PER_MSG.W))
-        enq_toBtx := init_toBtx_table_port
+        enq_toBtx := toBtx_table.io.portA.dout
         // NOTES:
         //   - We want to read the current value of toBtx here because if a pkt was dropped, we want to
         //     make sure that bit stays set.
@@ -277,7 +287,8 @@ class LNICPacketize(implicit p: Parameters) extends Module {
             init_scheduled_pkts_enq.bits := tx_pkt_desc
           } .otherwise {
             // mark pkt as in need of transmission via credit events
-            init_toBtx_table_port := enq_toBtx | tx_pkt_desc.tx_pkts            
+            toBtx_table.io.portA.we := true.B
+            toBtx_table.io.portA.din := enq_toBtx | tx_pkt_desc.tx_pkts
           }
         }
 
@@ -518,7 +529,9 @@ class LNICPacketize(implicit p: Parameters) extends Module {
 
       // check if all pkts have been delivered
       val num_pkts = MsgBufHelpers.compute_num_pkts(delivered_reg_1.bits.msg_len)
-      when (new_delivered_bitmap === (1.U << num_pkts) - 1.U) {
+      val all_pkts = Wire(UInt(MAX_PKTS_PER_MSG.W))
+      all_pkts := (1.U << num_pkts) - 1.U
+      when (new_delivered_bitmap === all_pkts) {
         // free tx_msg_id
         assert(tx_msg_id_freelist.io.enq.ready, "tx_msg_id_freelist is full when trying to free a tx_msg_id!")
         tx_msg_id_freelist.io.enq.valid := true.B
@@ -553,8 +566,8 @@ class LNICPacketize(implicit p: Parameters) extends Module {
   val toBtx_ptr = Wire(UInt(MAX_PKTS_PER_MSG.W))
   credit_ptr := creditToBtx_reg_0.bits.tx_msg_id
   toBtx_ptr := creditToBtx_reg_0.bits.tx_msg_id
-  val update_credit_table_port = credit_table(credit_ptr)
-  val update_toBtx_table_port = toBtx_table(toBtx_ptr)
+  credit_table.io.portB.addr := credit_ptr
+  toBtx_table.io.portB.addr := toBtx_ptr
 
   // TODO(sibanez): this state machine assumes events will not fire on back-to-back
   //   cycles. Need 2 cycles to perform RMW of state variables.
@@ -572,8 +585,8 @@ class LNICPacketize(implicit p: Parameters) extends Module {
       // get read results
       val credit = Wire(UInt(CREDIT_BITS.W))
       val toBtx = Wire(UInt(MAX_PKTS_PER_MSG.W))
-      credit := update_credit_table_port
-      toBtx := update_toBtx_table_port
+      credit := credit_table.io.portB.dout
+      toBtx := toBtx_table.io.portB.dout
 
       // update toBtx with rtx pkt
       val rtx_toBtx = Wire(UInt(MAX_PKTS_PER_MSG.W))
@@ -615,8 +628,10 @@ class LNICPacketize(implicit p: Parameters) extends Module {
       // update state
       credit_ptr := creditToBtx_reg_1.bits.tx_msg_id
       toBtx_ptr  := creditToBtx_reg_1.bits.tx_msg_id
-      update_credit_table_port := new_credit
-      update_toBtx_table_port := new_toBtx
+      credit_table.io.portB.we := true.B
+      credit_table.io.portB.din := new_credit
+      toBtx_table.io.portB.we := true.B
+      toBtx_table.io.portB.din := new_toBtx
 
       // state transition
       creditToBtxState := sReadState
@@ -670,7 +685,8 @@ class LNICPacketize(implicit p: Parameters) extends Module {
       max_tx_pkt_offset := max_tx_pkt_offset_port
 
       // find any pkts to retransmit
-      val rtx_pkts_mask = (1.U << timeout_reg_1.bits.metadata.rtx_offset) - 1.U
+      val rtx_pkts_mask = Wire(UInt(MAX_PKTS_PER_MSG.W))
+      rtx_pkts_mask := (1.U << timeout_reg_1.bits.metadata.rtx_offset) - 1.U
       val rtx_pkts = ~delivered_bitmap & rtx_pkts_mask
       when (rtx_pkts > 0.U && !reset.toBool) {
         // there are pkts to retransmit

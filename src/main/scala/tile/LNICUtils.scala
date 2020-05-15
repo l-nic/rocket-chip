@@ -3,6 +3,8 @@ package freechips.rocketchip.tile
 
 import Chisel._
 import chisel3.{VecInit, chiselTypeOf}
+import chisel3.util.HasBlackBoxResource
+import chisel3.experimental.IntParam
 import LNICConsts._
 
 object NetworkHelpers {
@@ -38,33 +40,6 @@ object MsgBufHelpers {
       free_list
     }
     VecInit(size_class_freelists.map(_.io).toSeq)
-  }
-}
-
-object MemHelpers {
-  // Initialize all memory entries with the provided value
-  def memory_init[T <: Data](mem_port: T, wr_addr: UInt, num_entries: Int, reset_val: T, init_done: Bool) = {
-
-    val sReset :: sIdle :: Nil = Enum(2)
-    val state = RegInit(sReset)
-
-    val index = RegInit(0.U(log2Ceil(num_entries).W))
-
-    switch(state) {
-      is (sReset) {
-        init_done := false.B
-        wr_addr := index
-        mem_port := reset_val
-        index := index + 1.U
-        when (index === (num_entries - 1).U) {
-          state := sIdle
-        }
-      }
-      is (sIdle) {
-        init_done := true.B
-      }
-    }
-
   }
 }
 
@@ -233,5 +208,56 @@ object StreamWidthAdapter {
     }
   }
 
+}
+
+class RWPortIO(val addr_width: Int, val data_width: Int) extends Bundle {
+  val addr = Input(UInt(addr_width.W))
+  val dout = Output(UInt(data_width.W))
+  val we   = Input(Bool())
+  val din  = Input(UInt(data_width.W))
+}
+
+/* BlackBox True Dual Port RAM */
+class TrueDualPortRAM(val data_width: Int, val num_entries: Int)
+    extends BlackBox(Map("DATA_WIDTH" -> IntParam(data_width),
+                         "NUM_ENTRIES" -> IntParam(num_entries)))
+    with HasBlackBoxResource {
+
+  val io = IO(new Bundle {
+    val clock = Input(Clock())
+    val reset = Input(Bool())
+    val portA = new RWPortIO(log2Up(num_entries), data_width) 
+    val portB = new RWPortIO(log2Up(num_entries), data_width) 
+  })
+
+  addResource("/vsrc/TrueDualPortRAM.v")
+}
+
+object MemHelpers {
+  // Initialize all memory entries with the provided value
+  def memory_init(mem_port: RWPortIO, num_entries: Int, reset_val: UInt, init_done: Bool) = {
+
+    val sReset :: sIdle :: Nil = Enum(2)
+    val state = RegInit(sReset)
+
+    val index = RegInit(0.U(log2Up(num_entries).W))
+
+    switch(state) {
+      is (sReset) {
+        init_done := false.B
+        mem_port.addr := index
+        mem_port.we := true.B
+        mem_port.din := reset_val
+        index := index + 1.U
+        when (index === (num_entries - 1).U) {
+          state := sIdle
+        }
+      }
+      is (sIdle) {
+        init_done := true.B
+      }
+    }
+
+  }
 }
 

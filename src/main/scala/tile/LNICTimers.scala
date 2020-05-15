@@ -55,21 +55,22 @@ class LNICTimers(implicit p: Parameters) extends Module {
   val io = IO(new LNICTimersIO)
 
   // Timer state
-  val timer_mem = SyncReadMem(NUM_MSG_BUFFERS, new TimerEntry)
+  val timer_mem = Module(new TrueDualPortRAM((new TimerEntry).getWidth, NUM_MSG_BUFFERS))
+  timer_mem.io.clock := clock
+  timer_mem.io.reset := reset
+  timer_mem.io.portA.we := false.B
+  timer_mem.io.portB.we := false.B
+
+  // initialize timer_mem so all entries are invalid
+  val init_done_reg = RegInit(false.B)
+  MemHelpers.memory_init(timer_mem.io.portA, NUM_MSG_BUFFERS, 0.U, init_done_reg)
 
   // Cycle counter to track time
   val now = RegInit(0.U(TIMER_BITS.W))
   now := now + 1.U
 
-  // port used for initialization and Schedule/Reschedule/Timeout Events
-  val timer_id = Wire(UInt(LNIC_MSG_ID_BITS.W))
-  val timer_rw_port = timer_mem(timer_id)
-
-  // initialize timer_mem so all entries are invalid
-  val init_done_reg = RegInit(false.B)
-  MemHelpers.memory_init(timer_rw_port, timer_id, NUM_MSG_BUFFERS, (new TimerEntry).fromBits(0.U), init_done_reg)
-
   /* Logic to process Schedule/Reschedule/Timeout Events */
+  // NOTE: uses timer_mem.io.portA
 
   // Pipeline regs
   val schedule_reg = RegNext(io.schedule)
@@ -77,7 +78,7 @@ class LNICTimers(implicit p: Parameters) extends Module {
 
   val new_timer_entry = Wire(new TimerEntry)
 
-  // state used to search for timeouts
+  // state machine used to search for timeouts
   val cur_timer_id = RegInit(0.U(LNIC_MSG_ID_BITS.W))
   val sRead :: sCheck :: Nil = Enum(2)
   val stateTimeout = RegInit(sRead)
@@ -92,20 +93,22 @@ class LNICTimers(implicit p: Parameters) extends Module {
       new_timer_entry.valid := true.B
       new_timer_entry.timeout_val := now + schedule_reg.bits.delay
       new_timer_entry.metadata := schedule_reg.bits.metadata
-      timer_id := schedule_reg.bits.msg_id
-      timer_rw_port := new_timer_entry
+      timer_mem.io.portA.addr := schedule_reg.bits.msg_id
+      timer_mem.io.portA.we   := true.B
+      timer_mem.io.portA.din  := new_timer_entry.asUInt
     } .elsewhen (reschedule_reg.valid) {
       stateTimeout := sRead // reset timeout state machine
       // process reschedule event
       new_timer_entry.valid := true.B
       new_timer_entry.timeout_val := now + reschedule_reg.bits.delay
       new_timer_entry.metadata := reschedule_reg.bits.metadata
-      timer_id := reschedule_reg.bits.msg_id
-      timer_rw_port := new_timer_entry
+      timer_mem.io.portA.addr := reschedule_reg.bits.msg_id
+      timer_mem.io.portA.we   := true.B
+      timer_mem.io.portA.din  := new_timer_entry.asUInt
     } .elsewhen (init_done_reg) {
       // state machine to search for timeouts
 
-      timer_id := cur_timer_id
+      timer_mem.io.portA.addr := cur_timer_id
 
       switch (stateTimeout) {
         is (sRead) {
@@ -116,7 +119,7 @@ class LNICTimers(implicit p: Parameters) extends Module {
         is (sCheck) {
           // get read result
           val cur_timer_entry = Wire(new TimerEntry)
-          cur_timer_entry := timer_rw_port
+          cur_timer_entry := (new TimerEntry).fromBits(timer_mem.io.portA.dout)
           when (cur_timer_entry.valid && now >= cur_timer_entry.timeout_val) {
             // fire timeout event
             io.timeout.valid := true.B
@@ -126,7 +129,8 @@ class LNICTimers(implicit p: Parameters) extends Module {
             val update_timer_entry = Wire(new TimerEntry)
             update_timer_entry := cur_timer_entry
             update_timer_entry.valid := false.B
-            timer_rw_port := update_timer_entry
+            timer_mem.io.portA.we := true.B
+            timer_mem.io.portA.din := update_timer_entry.asUInt
           }
           // move to next timer entry
           cur_timer_id := Mux(cur_timer_id === (NUM_MSG_BUFFERS-1).U,
@@ -140,6 +144,7 @@ class LNICTimers(implicit p: Parameters) extends Module {
   }
 
   /* Logic to process CancelEvents */
+  // NOTE: uses timer_mem.io.portB
 
   // Pipeline reg
   val cancel_reg = RegNext(io.cancel)
@@ -149,7 +154,9 @@ class LNICTimers(implicit p: Parameters) extends Module {
     cancel_entry.valid := false.B
     cancel_entry.timeout_val := 0.U
     cancel_entry.metadata := (new TimerMeta).fromBits(0.U)
-    timer_mem(cancel_reg.bits.msg_id) := cancel_entry
+    timer_mem.io.portB.addr := cancel_reg.bits.msg_id
+    timer_mem.io.portB.we := true.B
+    timer_mem.io.portB.din := cancel_entry.asUInt
   }
 
 }
