@@ -265,17 +265,15 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val ctrl_killm = Wire(Bool())
 
   if (usingLNIC) {
-    if (lnicUsingGPRs) {
-      // defaults for tx_cmd and rx_cmd
-      csr.io.tx.get.cmd.valid := false.B
-      csr.io.tx.get.cmd.bits := 0.U
-      csr.io.rx.get.cmd.ready := false.B
-      // drive the unread cmd for pipeline flushes
-      val ex_lnic_undo = ex_reg_lnic_ren.get && ctrl_killx && ex_reg_valid
-      val mem_lnic_undo = mem_reg_lnic_ren.get && ctrl_killm && mem_reg_valid
-      csr.io.rx_undo.get.valid := ex_lnic_undo || mem_lnic_undo
-      csr.io.rx_undo.get.bits := Cat(ex_lnic_undo, mem_lnic_undo)
-    }
+    // defaults for tx_cmd and rx_cmd
+    csr.io.tx.get.cmd.valid := false.B
+    csr.io.tx.get.cmd.bits := 0.U
+    csr.io.rx.get.cmd.ready := false.B
+    // drive the unread cmd for pipeline flushes
+    val ex_lnic_undo = ex_reg_lnic_ren.get && ctrl_killx && ex_reg_valid
+    val mem_lnic_undo = mem_reg_lnic_ren.get && ctrl_killm && mem_reg_valid
+    csr.io.rx_undo.get.valid := ex_lnic_undo || mem_lnic_undo
+    csr.io.rx_undo.get.bits := Cat(ex_lnic_undo, mem_lnic_undo)
 
     // Connect CSRFile network IO to RocketCore IO
     csr.io.net.get.net_in <> io.net.get.net_in
@@ -285,7 +283,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
   // TODO(sibanez): how to drive reg file read enable for L-NIC?
   val id_rs = id_raddr.zip(id_ren).map {
-    case (addr, rd_en) => rf.read(addr, rd_en && !ctrl_killd, csr.io.rx, usingLNIC && lnicUsingGPRs)
+    case (addr, rd_en) => rf.read(addr, rd_en && !ctrl_killd, csr.io.rx, usingLNIC)
   } 
 
   val id_csr_en = id_ctrl.csr.isOneOf(CSR.S, CSR.C, CSR.W)
@@ -428,7 +426,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   ex_reg_xcpt := !ctrl_killd && id_xcpt
   ex_reg_xcpt_interrupt := !take_pc && ibuf.io.inst(0).valid && csr.io.interrupt
   // Remember if the instruction read the LNIC rxQueue in the decode stage
-  if (usingLNIC && lnicUsingGPRs) {
+  if (usingLNIC) {
     ex_reg_lnic_ren.get := csr.io.rx.get.cmd.ready && csr.io.rx.get.cmd.valid
   }
 
@@ -529,7 +527,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   mem_reg_xcpt := !ctrl_killx && ex_xcpt
   mem_reg_xcpt_interrupt := !take_pc_mem_wb && ex_reg_xcpt_interrupt
   // Remember if the instruction read the LNIC rxQueue in the decode stage
-  if (usingLNIC && lnicUsingGPRs) {
+  if (usingLNIC) {
     mem_reg_lnic_ren.get := ex_reg_lnic_ren.get
   }
 
@@ -681,7 +679,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
                  Mux(wb_ctrl.csr =/= CSR.N, csr.io.rw.rdata,
                  Mux(wb_ctrl.mul, mul.map(_.io.resp.bits.data).getOrElse(wb_reg_wdata),
                  wb_reg_wdata))))
-  when (rf_wen) { rf.write(rf_waddr, rf_wdata, csr.io.tx, usingLNIC && lnicUsingGPRs) }
+  when (rf_wen) { rf.write(rf_waddr, rf_wdata, csr.io.tx, usingLNIC) }
 
   // hook up control/status regfile
   csr.io.ungated_clock := clock

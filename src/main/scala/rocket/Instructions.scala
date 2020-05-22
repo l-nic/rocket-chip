@@ -342,13 +342,11 @@ object CSRs {
   val fcsr = 0x3
 
   // LNIC CSRs
-  val lread = 0x051
   val lmsgsrdy = 0x052
   val lcurcontext = 0x053
   val lniccmd = 0x054
   val lcurpriority = 0x055
   val lidle = 0x056
-  val lwrite = 0x057
   val ltargetcontext = 0x058
   val ltargetpriority = 0x059
   

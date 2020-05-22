@@ -1,18 +1,32 @@
 
-package freechips.rocketchip.tile
+package freechips.rocketchip.rocket
 
 import Chisel._
 
-import chisel3.{VecInit, chiselTypeOf}
+import chisel3.{VecInit}
 import chisel3.experimental._
-import freechips.rocketchip.config._
-import freechips.rocketchip.subsystem._
-import freechips.rocketchip.diplomacy._
-import freechips.rocketchip.rocket._
-import freechips.rocketchip.tilelink._
-import freechips.rocketchip.util._
-import NetworkHelpers._
-import LNICConsts._
+import freechips.rocketchip.tile._
+import LNICRocketConsts._
+
+/**
+ * The Core's IO to the L-NIC module.
+ */
+class CoreLNICIO extends Bundle
+    with HasCoreParameters {
+  val net_in = Flipped(Decoupled(new StreamChannel(xLen)))
+  val meta_in = Flipped(Valid(new LNICRxMsgMeta))
+  val net_out = Decoupled(new LNICTxMsgWord)
+}
+
+class LNICTxMsgWord extends Bundle
+    with HasCoreParameters {
+  val data = UInt(xLen.W)
+  val src_context = UInt(LNIC_CONTEXT_BITS.W)
+}
+
+class LNICRxMsgMeta extends Bundle {
+  val dst_context = UInt(LNIC_CONTEXT_BITS.W)
+}
 
 /* LNIC TX Queue:
  * Lives in the Rocket Core CSR File.
@@ -20,9 +34,10 @@ import LNICConsts._
  * Tasks:
  *   - Store and schedule msg words for delivery to the LNIC
  */
-class LNICTxQueueIO extends Bundle {
-  val net_in = Flipped(Valid(UInt(XLEN.W))) // words written from the CPU
-  val net_out = Decoupled(new MsgWord)
+class LNICTxQueueIO extends Bundle
+    with HasCoreParameters {
+  val net_in = Flipped(Valid(UInt(xLen.W))) // words written from the CPU
+  val net_out = Decoupled(new LNICTxMsgWord)
 
   val cur_context = Input(UInt(width = LNIC_CONTEXT_BITS))
   // TODO(sibanez): no need to insert/remove contexts for now
@@ -30,22 +45,18 @@ class LNICTxQueueIO extends Bundle {
   // val remove = Input(Bool())
 }
 
-class MsgWord extends Bundle {
-  val data = UInt(XLEN.W)
-  val src_context = UInt(LNIC_CONTEXT_BITS.W)
-}
-
 @chiselName
-class LNICTxQueue(implicit p: Parameters) extends Module {
-  val num_contexts = p(LNICKey).maxNumContexts
+class LNICTxQueue(implicit p: Parameters) extends Module 
+    with HasCoreParameters {
+  val num_contexts = MAX_NUM_CONTEXTS
 
   val io = IO(new LNICTxQueueIO)
 
   // find max msg buffer size (in terms of 8B words) 
-  val max_msg_words = MSG_BUFFER_COUNT.map({ case (size: Int, count: Int) => size/XBYTES }).max
+  val max_msg_words = MAX_MSG_SIZE_BYTES/xBytes
 
-  val tx_queue_enq = Wire(Decoupled(new MsgWord))
-  io.net_out <> Queue(tx_queue_enq, max_msg_words*2)
+  val tx_queue_enq = Wire(Decoupled(new LNICTxMsgWord))
+  io.net_out <> Queue(tx_queue_enq, max_msg_words*num_contexts)
 
   /* Enqueue state machine
    *   - Check if entire msg fits in the tx queue before writing the first word
@@ -77,143 +88,20 @@ class LNICTxQueue(implicit p: Parameters) extends Module {
     is (sFinishEnq) {
       when (io.net_in.valid) {
         assert (tx_queue_enq.ready, "tx_queue is full during enqueue!")
-        when (rem_bytes_reg(io.cur_context) <= XBYTES.U) {
+        when (rem_bytes_reg(io.cur_context) <= xBytes.U) {
           // last word
           enqStates(io.cur_context) := sStartEnq
         }
         // update remaining bytes for the msg
-        rem_bytes_reg(io.cur_context) := rem_bytes_reg(io.cur_context) - XBYTES.U
+        rem_bytes_reg(io.cur_context) := rem_bytes_reg(io.cur_context) - xBytes.U
       }
     }
   }
 
-}
-
-
-/**
- * LNIC Arbiter classes
- * Used to schedule between control pkts (PktGen) and data pkts (Packetize) on the TX path.
- */
-class ArbiterIO extends Bundle {
-  // Generated control pkts
-  val ctrl_in = Flipped(Decoupled(new StreamChannel(NET_DP_BITS)))
-  val ctrl_meta_in = Flipped(Valid(new PISAEgressMetaIn))
-  // Packetized data pkts
-  val data_in = Flipped(Decoupled(new StreamChannel(NET_DP_BITS)))
-  val data_meta_in = Flipped(Valid (new PISAEgressMetaIn))
-  // Serialized pkts
-  val net_out = Decoupled(new StreamChannel(NET_DP_BITS))
-  val meta_out = Valid(new PISAEgressMetaIn)
-}
-
-@chiselName
-class LNICArbiter(implicit p: Parameters) extends Module {
-  val io = IO(new ArbiterIO)
-
-  val pktQueue_in = Wire(Decoupled(new StreamChannel(NET_DP_BITS)))
-  val metaQueue_in = Wire(Decoupled(new PISAEgressMetaIn))
-  val metaQueue_out = Wire(Flipped(Decoupled(new PISAEgressMetaIn)))
-
-  // Set up output queues
-  // TODO(sibanez): use params or consts here?
-  io.net_out <> Queue(pktQueue_in, p(LNICKey).arbiterPktBufFlits)
-  metaQueue_out <> Queue(metaQueue_in, p(LNICKey).arbiterMetaBufFlits)
-
-  when (reset.toBool) {
-    io.net_out.valid := false.B
-  }
-
-  /* state machine to arbitrate between ctrl_in and data_in */
-
-  val sInSelect :: sInWaitEnd :: Nil = Enum(2)
-  val inState = RegInit(sInSelect)
-
-  val ctrl :: data :: Nil = Enum(2)
-  val reg_selected = RegInit(ctrl)
-
-  // defaults
-  pktQueue_in.valid := false.B
-  pktQueue_in.bits := io.ctrl_in.bits
-  metaQueue_in.valid := false.B
-  metaQueue_in.bits := io.ctrl_meta_in.bits
-
-  io.ctrl_in.ready := false.B
-  io.data_in.ready := false.B
-
-  def selectCtrl() = {
-    reg_selected := ctrl
-    pktQueue_in <> io.ctrl_in
-    metaQueue_in.valid := true.B
-    metaQueue_in.bits := io.ctrl_meta_in.bits
-    when (pktQueue_in.valid && pktQueue_in.ready && pktQueue_in.bits.last) {
-      inState := sInSelect // stay in same state
-    } .otherwise {
-      inState := sInWaitEnd
-    }
-  }
-
-  def selectData() = {
-    reg_selected := data
-    pktQueue_in <> io.data_in
-    metaQueue_in.valid := true.B
-    metaQueue_in.bits := io.data_meta_in.bits
-    when (pktQueue_in.valid && pktQueue_in.ready && pktQueue_in.bits.last) {
-      inState := sInSelect // stay in same state
-    } .otherwise {
-      inState := sInWaitEnd
-    }
-  }
-
-  switch (inState) {
-    is (sInSelect) {
-      // select which input to read from
-      // NOTE: ctrl pkts are strictly prioritized over data pkts
-      when (io.ctrl_in.valid) {
-        selectCtrl()
-      } .elsewhen (io.data_in.valid) {
-        selectData()
-      }
-    }
-    is (sInWaitEnd) {
-      when (reg_selected === ctrl) {
-        // Ctrl pkt selected
-        pktQueue_in <> io.ctrl_in
-      } .otherwise {
-        // Data pkt selected
-        pktQueue_in <> io.data_in
-      }
-      // wait until end of selected pkt then transition back to sSelect
-      when (pktQueue_in.valid && pktQueue_in.ready && pktQueue_in.bits.last) {
-        inState := sInSelect
-      }
-    }
-  }
-
-  // state machine to drive metaQueue_out.ready
-  val sOutWordOne :: sOutWaitEnd :: Nil = Enum(2)
-  val outState = RegInit(sOutWordOne)
-
-  // only read metaQueue when first word is transferred to Egress pipeline
-  metaQueue_out.ready := (outState === sOutWordOne) && (io.net_out.valid && io.net_out.ready)
-  io.meta_out.valid := (outState === sOutWordOne) && (io.net_out.valid && metaQueue_out.valid)
-  io.meta_out.bits := metaQueue_out.bits
-
-  switch (outState) {
-    is (sOutWordOne) {
-      when (io.net_out.valid && io.net_out.ready && !io.net_out.bits.last) {
-        outState := sOutWaitEnd
-      }
-    }
-    is (sOutWaitEnd) {
-      when (io.net_out.valid && io.net_out.ready && io.net_out.bits.last) {
-        outState := sOutWordOne
-      }
-    }
-  }
 }
 
 /**
- * LNIC Per-Context FIFO queues and interrupt generation.
+ * LNIC Per-Context RX FIFO queues and interrupt generation.
  *
  * Tasks:
  *   - Receive messages from the reassembly buffer.
@@ -227,10 +115,11 @@ class LNICArbiter(implicit p: Parameters) extends Module {
  *   - If the current_context_idle signal is asserted and top_context =/= current_context then generate an interrupt
  *   - Insert / remove the current context when told to do so
  */
-class LNICRxQueuesIO(val num_entries: Int) extends Bundle {
-  val net_in = Flipped(Decoupled(new StreamChannel(XLEN)))
-  val meta_in = Flipped(Valid(new NetToCoreMeta))
-  val net_out = Decoupled(UInt(width = XLEN)) // words to the CPU
+class LNICRxQueuesIO(val num_entries: Int) extends Bundle 
+    with HasCoreParameters {
+  val net_in = Flipped(Decoupled(new StreamChannel(xLen)))
+  val meta_in = Flipped(Valid(new LNICRxMsgMeta))
+  val net_out = Decoupled(UInt(width = xLen)) // words to the CPU
 
   val cur_context = Input(UInt(width = LNIC_CONTEXT_BITS))
   val cur_priority = Input(UInt(width = LNIC_PRIORITY_BITS))
@@ -249,8 +138,9 @@ class LNICRxQueuesIO(val num_entries: Int) extends Bundle {
   override def cloneType = new LNICRxQueuesIO(num_entries).asInstanceOf[this.type]
 }
 
-class FIFOWord(val ptrBits: Int) extends Bundle {
-  val word = UInt(width = XLEN)
+class FIFOWord(val ptrBits: Int) extends Bundle 
+    with HasCoreParameters {
+  val word = UInt(width = xLen)
   val next = UInt(width = ptrBits)
 
   override def cloneType = new FIFOWord(ptrBits).asInstanceOf[this.type]
@@ -281,9 +171,10 @@ class RxHeadTableEntry(ptrBits: Int) extends HeadTableEntry(ptrBits) {
 }
 
 @chiselName
-class LNICRxQueues(implicit p: Parameters) extends Module {
-  val num_entries = p(LNICKey).rxBufFlits
-  val num_contexts = p(LNICKey).maxNumContexts
+class LNICRxQueues(implicit p: Parameters) extends Module
+    with HasCoreParameters {
+  val num_entries = (MAX_MSG_SIZE_BYTES/xBytes)*MAX_NUM_CONTEXTS
+  val num_contexts = MAX_NUM_CONTEXTS
 
   val io = IO(new LNICRxQueuesIO(num_entries))
 
@@ -540,53 +431,6 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
       }
     }
     head_table(index) := new_head_entry
-  }
-
-}
-
-// entries is a Seq of UInt values with which to initialize the freelist.
-class FreeList(val entries: Seq[UInt]) extends Module {
-  val io = IO(new Bundle {
-    // enq ptrs into this module
-    val enq = Flipped(Decoupled(chiselTypeOf(entries(0))))
-    // deq ptrs from this module
-    val deq = Decoupled(chiselTypeOf(entries(0)))
-  })
-
-  // create FIFO queue to store pointers
-  val queue_in = Wire(Decoupled(chiselTypeOf(entries(0))))
-  val queue_out = Queue(queue_in, entries.size)
-
-  val sReset :: sIdle :: Nil = Enum(2)
-  val state = RegInit(sReset)
-
-  val entries_vec = Vec(entries)
-  val index = RegInit(0.U(log2Ceil(entries.size).W))
-
-  // default - connect queue to enq/deq interfaces
-  queue_in <> io.enq
-  io.deq <> queue_out
-
-  switch(state) {
-    is (sReset) {
-      // disconnect queue from enq/deq interfaces
-      io.enq.ready := false.B
-      io.deq.valid := false.B
-      queue_out.ready := false.B
-      // insert entries into the queue on reset
-      queue_in.valid := true.B
-      queue_in.bits := entries_vec(index)
-      when (queue_in.ready) {
-        index := index + 1.U
-      }
-      when (index === (entries.size - 1).U) {
-        state := sIdle
-      }
-    }
-    is (sIdle) {
-      queue_in <> io.enq
-      io.deq <> queue_out
-    }
   }
 
 }

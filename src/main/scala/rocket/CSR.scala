@@ -231,11 +231,11 @@ class CSRFileIO(implicit p: Parameters) extends CoreBundle
   val trace = Vec(retireWidth, new TracedInstruction).asOutput
   val net = if (usingLNIC) Some(new CoreLNICIO()) else None
   // RegFile tells CSRFile when to enq data into txQueue
-  val tx = if (usingLNIC && lnicUsingGPRs) Some(new CSRTxCmd) else None
+  val tx = if (usingLNIC) Some(new CSRTxCmd) else None
   // RegFile tells CSRFile when to deq data from rxQueue
-  val rx = if (usingLNIC && lnicUsingGPRs) Some(new CSRRxCmd) else None
+  val rx = if (usingLNIC) Some(new CSRRxCmd) else None
   // RocketCore control logic indicates when to undo rx cmds (up to 2 words)
-  val rx_undo = if (usingLNIC && lnicUsingGPRs) Some(Flipped(Valid(UInt(width = 2)))) else None
+  val rx_undo = if (usingLNIC) Some(Flipped(Valid(UInt(width = 2)))) else None
 }
 
 @chiselName
@@ -385,30 +385,18 @@ class CSRFile(
     io.net.get.net_out <> txQueues.io.net_out
     txQueues.io.cur_context := reg_lcurcontext.get
     //txQueues.io.insert := insert_context
-    if (lnicUsingGPRs) {
-      /* Wire up txQueue_in */
-      txQueue_in.get.valid := io.tx.get.cmd.valid
-      txQueue_in.get.bits := io.tx.get.cmd.bits
+
+    /* Wire up txQueue_in */
+    txQueue_in.get.valid := io.tx.get.cmd.valid
+    txQueue_in.get.bits := io.tx.get.cmd.bits
   
-      /* Wire up rxQueue_out */
-      rxQueue_out.get.ready := io.rx.get.cmd.ready
-      io.rx.get.cmd.valid := rxQueue_out.get.valid
-      io.rx.get.cmd.bits := rxQueue_out.get.bits
+    /* Wire up rxQueue_out */
+    rxQueue_out.get.ready := io.rx.get.cmd.ready
+    io.rx.get.cmd.valid := rxQueue_out.get.valid
+    io.rx.get.cmd.bits := rxQueue_out.get.bits
 
-      /* Wire up rxQueue unread cmd */
-      rxQueues.io.unread <> io.rx_undo.get
-    } else { // using CSRs
-      /* Set txQueue_in defaults */
-      txQueue_in.get.valid := false.B
-      txQueue_in.get.bits := 0.U
-
-      /* Set rxQueue_out defaults */
-      rxQueue_out.get.ready := false.B
-
-      /* Wire up rxQueue unread cmd */
-      rxQueues.io.unread.valid := false.B
-      rxQueues.io.unread.bits := 0.U
-    }
+    /* Wire up rxQueue unread cmd */
+    rxQueues.io.unread <> io.rx_undo.get
   }
 
   val reg_instret = WideCounter(64, io.retire)
@@ -557,10 +545,6 @@ class CSRFile(
     read_mapping += CSRs.ltargetcontext -> reg_ltargetcontext.get
     read_mapping += CSRs.ltargetpriority -> reg_ltargetpriority.get
     read_mapping += CSRs.lidle -> 0.U
-    if (lnicUsingCSRs) {
-      read_mapping += CSRs.lread -> rxQueue_out.get.bits
-      read_mapping += CSRs.lwrite -> 0.U
-    }
   }
 
   val pmpCfgPerCSR = xLen / new PMPConfig().getWidth
@@ -624,7 +608,7 @@ class CSRFile(
       io_dec.fp_csr && io_dec.fp_illegal
     io_dec.write_illegal := io_dec.csr(11,10).andR
     // Do not flush the pipeline on writes to LNIC CSRs
-    io_dec.write_flush := !(io_dec.csr >= CSRs.mscratch && io_dec.csr <= CSRs.mtval || io_dec.csr >= CSRs.sscratch && io_dec.csr <= CSRs.stval || (io_dec.csr >= CSRs.lread && io_dec.csr <= CSRs.ltargetpriority))
+    io_dec.write_flush := !(io_dec.csr >= CSRs.mscratch && io_dec.csr <= CSRs.mtval || io_dec.csr >= CSRs.sscratch && io_dec.csr <= CSRs.stval || (io_dec.csr >= CSRs.lmsgsrdy && io_dec.csr <= CSRs.ltargetpriority))
     io_dec.system_illegal := reg_mstatus.prv < io_dec.csr(9,8) ||
       is_wfi && !allow_wfi ||
       is_ret && !allow_sret ||
@@ -810,21 +794,6 @@ class CSRFile(
       when (decoded_addr(CSRs.lidle)) {
         app_idle := wdata(0).asBool
       }
-    }
-
-    if (lnicUsingCSRs) {
-      // wire up txQueue_in
-      when (csr_wen && decoded_addr(CSRs.lwrite)) {
-        txQueue_in.get.valid := true.B
-        txQueue_in.get.bits := wdata
-        // NOTE: txQueue_in.get.bits.last/keep are driven below
-        // TODO(sibanez): what to do when txQueue is full (i.e. !txQueue_in.ready)
-        // That will only happen if the NIC is unable to keep up with the CPU
-      }
-
-      // wire up rxQueue_out
-      val csr_ren = io.rw.cmd.isOneOf(CSR.R, CSR.I, CSR.W, CSR.S, CSR.C)
-      rxQueue_out.get.ready := csr_ren && decoded_addr(CSRs.lread)
     }
 
     /**********************************/
