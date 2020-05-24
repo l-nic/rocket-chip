@@ -4,10 +4,11 @@
 package freechips.rocketchip.rocket
 
 import Chisel._
-import chisel3.experimental.dontTouch
+import chisel3.dontTouch
 import freechips.rocketchip.config.{Parameters, Field}
 import freechips.rocketchip.subsystem._
 import freechips.rocketchip.diplomacy._
+import freechips.rocketchip.diplomaticobjectmodel.model.OMSRAM
 import freechips.rocketchip.tile._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util._
@@ -93,7 +94,7 @@ abstract class L1HellaCacheBundle(implicit val p: Parameters) extends Parameteri
 
 trait HasCoreMemOp extends HasCoreParameters {
   val addr = UInt(width = coreMaxAddrBits)
-  val tag  = Bits(width = dcacheReqTagBits)
+  val tag  = Bits(width = coreParams.dcacheReqTagBits + log2Ceil(dcacheArbPorts))
   val cmd  = Bits(width = M_SZ)
   val size = Bits(width = log2Ceil(coreDataBytes.log2 + 1))
   val signed = Bool()
@@ -101,11 +102,13 @@ trait HasCoreMemOp extends HasCoreParameters {
 
 trait HasCoreData extends HasCoreParameters {
   val data = Bits(width = coreDataBits)
+  val mask = UInt(width = coreDataBytes)
 }
 
 class HellaCacheReqInternal(implicit p: Parameters) extends CoreBundle()(p) with HasCoreMemOp {
   val phys = Bool()
   val no_alloc = Bool()
+  val no_xcpt = Bool()
 }
 
 class HellaCacheReq(implicit p: Parameters) extends HellaCacheReqInternal()(p) with HasCoreData
@@ -131,10 +134,7 @@ class HellaCacheExceptions extends Bundle {
   val ae = new AlignmentExceptions
 }
 
-class HellaCacheWriteData(implicit p: Parameters) extends CoreBundle()(p) {
-  val data = UInt(width = coreDataBits)
-  val mask = UInt(width = coreDataBytes)
-}
+class HellaCacheWriteData(implicit p: Parameters) extends CoreBundle()(p) with HasCoreData
 
 class HellaCachePerfEvents extends Bundle {
   val acquire = Bool()
@@ -198,6 +198,8 @@ abstract class HellaCache(hartid: Int)(implicit p: Parameters) extends LazyModul
   def flushOnFenceI = cfg.scratch.isEmpty && !node.edges.out(0).manager.managers.forall(m => !m.supportsAcquireT || !m.executable || m.regionType >= RegionType.TRACKED || m.regionType <= RegionType.IDEMPOTENT)
 
   require(!tileParams.core.haveCFlush || cfg.scratch.isEmpty, "CFLUSH_D_L1 instruction requires a D$")
+
+  def getOMSRAMs(): Seq[OMSRAM]
 }
 
 class HellaCacheBundle(val outer: HellaCache)(implicit p: Parameters) extends CoreBundle()(p) {

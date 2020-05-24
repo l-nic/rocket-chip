@@ -1,7 +1,7 @@
 
 global def hardfloatScalaModule =
   makeScalaModuleFromJSON here "hardfloat"
-  | setScalaModuleRootDir "berkeley-hardfloat"
+  | setScalaModuleRootDir "hardfloat"
   | setScalaModuleDeps (chisel3ScalaModule, Nil)
   | setScalaModuleScalacOptions ("-Xsource:2.11", Nil)
 
@@ -11,9 +11,15 @@ global def rocketchipMacros =
   | addMacrosParadiseCompilerPlugin
 
 global def rocketchipScalaModule =
+  def deps =
+    rocketchipMacros,
+    hardfloatScalaModule,
+    hardfloatScalaModule,
+    apiConfigChipsallianceScalaModule,
+    Nil
   makeScalaModuleFromJSON here "rocketchip"
   | setScalaModuleRootDir "rocket-chip"
-  | setScalaModuleDeps (rocketchipMacros, hardfloatScalaModule, Nil)
+  | setScalaModuleDeps deps
   | setScalaModuleScalacOptions ("-Xsource:2.11", Nil)
   | addMacrosParadiseCompilerPlugin
 
@@ -72,9 +78,10 @@ tuple RocketChipGeneratorOptions =
   global TopModuleName: String
   global ConfigNames:   List String
   global ExtraSources:  List Path
+  global BaseFileName:  Option String
 
 global def makeRocketChipGeneratorOptions jars targetDir topModule configs =
-  RocketChipGeneratorOptions jars targetDir topModule configs Nil
+  RocketChipGeneratorOptions jars targetDir topModule configs Nil None
 
 tuple RocketChipGeneratorOutputs =
   DTS_:            Path
@@ -106,11 +113,14 @@ global def runRocketChipGenerator options =
     def relJars = jars | map getPathName | map (relative runDir)
     def classpath = catWith ":" relJars
     def relTargetDir = relative runDir targetDir.getPathName
+    def baseFileName = match options.getRocketChipGeneratorOptionsBaseFileName
+      Some name = name, Nil
+      None = Nil
     which "java", "-cp", classpath, main,
     relTargetDir,
     rootPackage, topModule,
     rootPackage, configs,
-    Nil
+    baseFileName
 
   def inputs =
     def bootrom = source 'rocket-chip/bootrom/bootrom.img'
