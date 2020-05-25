@@ -36,7 +36,7 @@ trait HasNonDiplomaticTileParameters {
   implicit val p: Parameters
   def tileParams: TileParams = p(TileKey)
 
-  def usingLNIC: Boolean = p(LNICKey).nonEmpty
+  def usingLNIC: Boolean = p(LNICRocketKey).nonEmpty
   def usingVM: Boolean = tileParams.core.useVM
   def usingUser: Boolean = tileParams.core.useUser || usingVM
   def usingDebug: Boolean = tileParams.core.useDebug
@@ -112,12 +112,7 @@ trait HasNonDiplomaticTileParameters {
 
     val pmp = if (tileParams.core.nPMPs > 0) Map("riscv,pmpregions" -> tileParams.core.nPMPs.asProperty) else Nil
 
-    // TODO(sibanez): add LNIC params to tileProperties
-    val lnic = if (usingLNIC) Map(
-      "lnic-rx-buf-flits"     -> p(LNICKey).rxBufFlits.asProperty
-    ) else Nil
-
-    dcache ++ icache ++ dtlb ++ itlb ++ mmu ++ pmp ++ incoherent ++ lnic
+    dcache ++ icache ++ dtlb ++ itlb ++ mmu ++ pmp ++ incoherent
   }
 
 }

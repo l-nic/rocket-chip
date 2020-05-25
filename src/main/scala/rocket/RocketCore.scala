@@ -1002,7 +1002,7 @@ class RegFile(n: Int, w: Int, zero: Boolean = false) {
     if (usingLNICGPRs) {
       when (addr === 0.U) {
         reads.last._2 := 0.U
-      }.elsewhen (addr === LNICConsts.LREAD_ADDR && lnic_rd_en) {
+      }.elsewhen (addr === LNICRocketConsts.LREAD_ADDR && lnic_rd_en) {
         // read from rxQueue
         // NOTE: if csr_rx.get.cmd.valid == false.B then the result is undefined.
         // Alternatively, we could stall the pipeline until valid data arrives,
@@ -1024,7 +1024,7 @@ class RegFile(n: Int, w: Int, zero: Boolean = false) {
     canRead = false
     when (addr =/= UInt(0)) {
       if (usingLNICGPRs) {
-        when (addr === LNICConsts.LWRITE_ADDR) {
+        when (addr === LNICRocketConsts.LWRITE_ADDR) {
           // write to txQueue
           csr_tx.get.cmd.valid := true.B
           csr_tx.get.cmd.bits := data

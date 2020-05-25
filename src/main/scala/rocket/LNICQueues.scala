@@ -5,22 +5,28 @@ import Chisel._
 
 import chisel3.{VecInit}
 import chisel3.experimental._
+import freechips.rocketchip.config.Parameters
 import freechips.rocketchip.tile._
 import LNICRocketConsts._
+
+// the first word of every msg sent by application
+class TxAppHdr extends Bundle {
+  val dst_ip = UInt(32.W)
+  val dst_context = UInt(LNIC_CONTEXT_BITS.W)
+  val msg_len = UInt(MSG_LEN_BITS.W)
+}
 
 /**
  * The Core's IO to the L-NIC module.
  */
-class CoreLNICIO extends Bundle
-    with HasCoreParameters {
-  val net_in = Flipped(Decoupled(new StreamChannel(xLen)))
+class CoreLNICIO extends Bundle {
+  val net_in = Flipped(Decoupled(new StreamChannel(XLEN)))
   val meta_in = Flipped(Valid(new LNICRxMsgMeta))
   val net_out = Decoupled(new LNICTxMsgWord)
 }
 
-class LNICTxMsgWord extends Bundle
-    with HasCoreParameters {
-  val data = UInt(xLen.W)
+class LNICTxMsgWord extends Bundle {
+  val data = UInt(XLEN.W)
   val src_context = UInt(LNIC_CONTEXT_BITS.W)
 }
 
@@ -34,9 +40,8 @@ class LNICRxMsgMeta extends Bundle {
  * Tasks:
  *   - Store and schedule msg words for delivery to the LNIC
  */
-class LNICTxQueueIO extends Bundle
-    with HasCoreParameters {
-  val net_in = Flipped(Valid(UInt(xLen.W))) // words written from the CPU
+class LNICTxQueueIO extends Bundle {
+  val net_in = Flipped(Valid(UInt(XLEN.W))) // words written from the CPU
   val net_out = Decoupled(new LNICTxMsgWord)
 
   val cur_context = Input(UInt(width = LNIC_CONTEXT_BITS))
@@ -46,14 +51,13 @@ class LNICTxQueueIO extends Bundle
 }
 
 @chiselName
-class LNICTxQueue(implicit p: Parameters) extends Module 
-    with HasCoreParameters {
-  val num_contexts = MAX_NUM_CONTEXTS
+class LNICTxQueue(implicit p: Parameters) extends Module {
+  val num_contexts = p(LNICRocketKey).get.maxNumContexts
 
   val io = IO(new LNICTxQueueIO)
 
   // find max msg buffer size (in terms of 8B words) 
-  val max_msg_words = MAX_MSG_SIZE_BYTES/xBytes
+  val max_msg_words = MAX_MSG_SIZE_BYTES/XBYTES
 
   val tx_queue_enq = Wire(Decoupled(new LNICTxMsgWord))
   io.net_out <> Queue(tx_queue_enq, max_msg_words*num_contexts)
@@ -88,12 +92,12 @@ class LNICTxQueue(implicit p: Parameters) extends Module
     is (sFinishEnq) {
       when (io.net_in.valid) {
         assert (tx_queue_enq.ready, "tx_queue is full during enqueue!")
-        when (rem_bytes_reg(io.cur_context) <= xBytes.U) {
+        when (rem_bytes_reg(io.cur_context) <= XBYTES.U) {
           // last word
           enqStates(io.cur_context) := sStartEnq
         }
         // update remaining bytes for the msg
-        rem_bytes_reg(io.cur_context) := rem_bytes_reg(io.cur_context) - xBytes.U
+        rem_bytes_reg(io.cur_context) := rem_bytes_reg(io.cur_context) - XBYTES.U
       }
     }
   }
@@ -115,11 +119,10 @@ class LNICTxQueue(implicit p: Parameters) extends Module
  *   - If the current_context_idle signal is asserted and top_context =/= current_context then generate an interrupt
  *   - Insert / remove the current context when told to do so
  */
-class LNICRxQueuesIO(val num_entries: Int) extends Bundle 
-    with HasCoreParameters {
-  val net_in = Flipped(Decoupled(new StreamChannel(xLen)))
+class LNICRxQueuesIO(val num_entries: Int) extends Bundle {
+  val net_in = Flipped(Decoupled(new StreamChannel(XLEN)))
   val meta_in = Flipped(Valid(new LNICRxMsgMeta))
-  val net_out = Decoupled(UInt(width = xLen)) // words to the CPU
+  val net_out = Decoupled(UInt(width = XLEN)) // words to the CPU
 
   val cur_context = Input(UInt(width = LNIC_CONTEXT_BITS))
   val cur_priority = Input(UInt(width = LNIC_PRIORITY_BITS))
@@ -138,9 +141,8 @@ class LNICRxQueuesIO(val num_entries: Int) extends Bundle
   override def cloneType = new LNICRxQueuesIO(num_entries).asInstanceOf[this.type]
 }
 
-class FIFOWord(val ptrBits: Int) extends Bundle 
-    with HasCoreParameters {
-  val word = UInt(width = xLen)
+class FIFOWord(val ptrBits: Int) extends Bundle {
+  val word = UInt(width = XLEN)
   val next = UInt(width = ptrBits)
 
   override def cloneType = new FIFOWord(ptrBits).asInstanceOf[this.type]
@@ -171,10 +173,9 @@ class RxHeadTableEntry(ptrBits: Int) extends HeadTableEntry(ptrBits) {
 }
 
 @chiselName
-class LNICRxQueues(implicit p: Parameters) extends Module
-    with HasCoreParameters {
-  val num_entries = (MAX_MSG_SIZE_BYTES/xBytes)*MAX_NUM_CONTEXTS
-  val num_contexts = MAX_NUM_CONTEXTS
+class LNICRxQueues(implicit p: Parameters) extends Module {
+  val num_contexts = p(LNICRocketKey).get.maxNumContexts
+  val num_entries = (MAX_MSG_SIZE_BYTES/XBYTES)*num_contexts
 
   val io = IO(new LNICRxQueuesIO(num_entries))
 

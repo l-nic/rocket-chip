@@ -5,7 +5,7 @@ package freechips.rocketchip.rocket
 
 import Chisel._
 import freechips.rocketchip.config.Parameters
-import freechips.rocketchip.tile.{CoreModule, NetworkHelpers}
+import freechips.rocketchip.tile.{CoreModule}
 
 object ALU
 {

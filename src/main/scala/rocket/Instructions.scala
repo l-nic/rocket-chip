@@ -979,19 +979,6 @@ object CSRs {
     res += fflags
     res += frm
     res += fcsr
-<<<<<<< HEAD
-
-    res += lread
-    res += lmsgsrdy
-    res += lcurcontext
-    res += lniccmd
-    res += lcurpriority
-    res += lidle
-    res += lwrite
-    res += ltargetcontext
-    res += ltargetpriority
-
-=======
     res += ustatus
     res += uie
     res += utvec
@@ -1003,7 +990,15 @@ object CSRs {
     res += ucause
     res += utval
     res += uip
->>>>>>> chipyard-rocket-chip-5-23-2020
+
+    res += lmsgsrdy
+    res += lcurcontext
+    res += lniccmd
+    res += lcurpriority
+    res += lidle
+    res += ltargetcontext
+    res += ltargetpriority
+
     res += cycle
     res += time
     res += instret

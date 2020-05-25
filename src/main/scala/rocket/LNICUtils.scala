@@ -5,8 +5,11 @@ import Chisel._
 
 import chisel3.{chiselTypeOf}
 import chisel3.experimental._
+import freechips.rocketchip.config._
 
 object LNICRocketConsts {
+  val XLEN = 64
+  val XBYTES = XLEN/8
   val LWRITE_ADDR = 31.U
   val LREAD_ADDR = 30.U
   val LNIC_CONTEXT_BITS = 16
@@ -15,6 +18,12 @@ object LNICRocketConsts {
   val MAX_NUM_CONTEXTS = 2
   val MAX_MSG_SIZE_BYTES = 8192
 }
+
+case class LNICRocketParams(
+  maxNumContexts:  Int = LNICRocketConsts.MAX_NUM_CONTEXTS
+)
+
+case object LNICRocketKey extends Field[Option[LNICRocketParams]](None)
 
 /**
  * NOTE: Copied StreamChannel and StreamIO here to avoid dependency on testchipip.
@@ -38,6 +47,13 @@ class StreamIO(w: Int) extends Bundle {
   }
 
   override def cloneType = new StreamIO(w).asInstanceOf[this.type]
+}
+
+object NetworkHelpers {
+  def reverse_bytes(a: UInt, n: Int) = {
+    val bytes = (0 until n).map(i => a((i + 1) * 8 - 1, i * 8))
+    Cat(bytes)
+  }
 }
 
 // entries is a Seq of UInt values with which to initialize the freelist.
