@@ -238,7 +238,8 @@ abstract class BaseTile private (val crossing: ClockCrossingType, q: Parameters)
   this.suggestName(tileParams.name)
 }
 
-abstract class BaseTileModuleImp[+L <: BaseTile](val outer: L) extends LazyModuleImp(outer) with HasTileParameters {
+abstract class BaseTileModuleImp[+L <: BaseTile](val outer: L) extends LazyModuleImp(outer)
+    with HasTileParameters {
 
   require(xLen == 32 || xLen == 64)
   require(paddrBits <= maxPAddrBits)
@@ -247,6 +248,9 @@ abstract class BaseTileModuleImp[+L <: BaseTile](val outer: L) extends LazyModul
   require (log2Up(hartId + 1) <= hartIdLen, s"p(MaxHartIdBits) of $hartIdLen is not enough for hartid $hartId")
 
   val constants = IO(new TileInputConstants)
+
+  // create tile LNIC IO
+  val net = if (usingLNIC) Some(IO(new CoreLNICIO)) else None
 }
 
 /** Some other non-tilelink but still standard inputs */

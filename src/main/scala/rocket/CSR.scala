@@ -414,9 +414,9 @@ class CSRFile(
   val reg_ltargetcontext = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
   val reg_ltargetpriority = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
   // rxQueue must be able to support unread operations for pipeline flushes if using GPRs
-  val rxQueues = Module(new LNICRxQueues)
+  val rxQueues = if (usingLNIC) Some(Module(new LNICRxQueues)) else None
   val rxQueue_out = if (usingLNIC) Some(Wire(Flipped(Decoupled(UInt(width = xLen))))) else None
-  val txQueues = Module(new LNICTxQueue)
+  val txQueues = if (usingLNIC) Some(Module(new LNICTxQueue)) else None
   val txQueue_in = if (usingLNIC) Some(Wire(Valid(UInt(width = xLen)))) else None
   // signal to tell rxQueues to register the current context
   val insert_context = Wire(Bool())
@@ -426,21 +426,21 @@ class CSRFile(
 
   if (usingLNIC) {
     // Connect rxQueues IO
-    rxQueues.io.net_in <> io.net.get.net_in
-    rxQueues.io.meta_in <> io.net.get.meta_in
-    rxQueue_out.get <> rxQueues.io.net_out
-    rxQueues.io.cur_context := reg_lcurcontext.get
-    rxQueues.io.cur_priority := reg_lcurpriority.get
-    rxQueues.io.insert := insert_context
-    rxQueues.io.idle := app_idle
+    rxQueues.get.io.net_in <> io.net.get.net_in
+    rxQueues.get.io.meta_in <> io.net.get.meta_in
+    rxQueue_out.get <> rxQueues.get.io.net_out
+    rxQueues.get.io.cur_context := reg_lcurcontext.get
+    rxQueues.get.io.cur_priority := reg_lcurpriority.get
+    rxQueues.get.io.insert := insert_context
+    rxQueues.get.io.idle := app_idle
     // update target context / priority CSRs
-    reg_ltargetcontext.get := rxQueues.io.top_context
-    reg_ltargetpriority.get := rxQueues.io.top_priority
+    reg_ltargetcontext.get := rxQueues.get.io.top_context
+    reg_ltargetpriority.get := rxQueues.get.io.top_priority
     // Connect txQueues IO
-    txQueues.io.net_in <> txQueue_in.get
-    io.net.get.net_out <> txQueues.io.net_out
-    txQueues.io.cur_context := reg_lcurcontext.get
-    //txQueues.io.insert := insert_context
+    txQueues.get.io.net_in <> txQueue_in.get
+    io.net.get.net_out <> txQueues.get.io.net_out
+    txQueues.get.io.cur_context := reg_lcurcontext.get
+    //txQueues.get.io.insert := insert_context
 
     /* Wire up txQueue_in */
     txQueue_in.get.valid := io.tx.get.cmd.valid
@@ -452,7 +452,7 @@ class CSRFile(
     io.rx.get.cmd.bits := rxQueue_out.get.bits
 
     /* Wire up rxQueue unread cmd */
-    rxQueues.io.unread <> io.rx_undo.get
+    rxQueues.get.io.unread <> io.rx_undo.get
   }
 
   val reg_instret = WideCounter(64, io.retire)
@@ -463,7 +463,9 @@ class CSRFile(
 
   val mip = Wire(init=reg_mip)
   mip.lip := (io.interrupts.lip: Seq[Bool])
-  mip.lnip := rxQueues.io.interrupt // wire up LNIC interrupt
+  if (usingLNIC) {
+    mip.lnip := rxQueues.get.io.interrupt // wire up LNIC interrupt
+  }
   mip.mtip := io.interrupts.mtip
   mip.msip := io.interrupts.msip
   mip.meip := io.interrupts.meip
@@ -866,7 +868,7 @@ class CSRFile(
     /**********************************/
     // TODO(sibanez): for now, we just need lmsgsrdy to be >0 when there are words available and 0 otherwise.
     // Eventually, it may be nice to use lmsgsrdy to indicate the actual number of msgs available.
-    reg_lmsgsrdy.get := (rxQueues.io.count > 0).asUInt
+    reg_lmsgsrdy.get := (rxQueues.get.io.count > 0).asUInt
   }
 
   io.csrw_counter := Mux(coreParams.haveBasicCounters && csr_wen && (io.rw.addr.inRange(CSRs.mcycle, CSRs.mcycle + CSR.nCtr) || io.rw.addr.inRange(CSRs.mcycleh, CSRs.mcycleh + CSR.nCtr)), UIntToOH(io.rw.addr(log2Ceil(CSR.nCtr+nPerfCounters)-1, 0)), 0.U)

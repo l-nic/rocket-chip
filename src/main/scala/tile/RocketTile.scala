@@ -39,7 +39,6 @@ class RocketTile private(
     extends BaseTile(rocketParams, crossing, lookup, q)
     with SinksExternalInterrupts
     with SourcesExternalNotifications
-    with CanHaveLNIC
     with HasLazyRoCC  // implies CanHaveSharedFPU with CanHavePTW with HasHellaCache
     with HasHellaCache
     with HasICacheFrontend
@@ -119,7 +118,6 @@ class RocketTile private(
 
 class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
     with HasFpuOpt
-    with CanHaveLNICModule
     with HasLazyRoCCModule
     with HasICacheFrontendModule {
   Annotated.params(this, outer.rocketParams)
@@ -167,6 +165,11 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
     core.io.rocc.resp <> respArb.get.io.out
     core.io.rocc.busy <> (cmdRouter.get.io.busy || outer.roccs.map(_.module.io.busy).reduce(_ || _))
     core.io.rocc.interrupt := outer.roccs.map(_.module.io.interrupt).reduce(_ || _)
+  }
+
+  // connect LNIC IO to core
+  if (usingLNIC) {
+    net.get <> core.io.net.get
   }
 
   // Rocket has higher priority to DTIM than other TileLink clients
