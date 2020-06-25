@@ -421,8 +421,10 @@ class CSRFile(
   // signal to tell rxQueues to register the current context
   val insert_context = Wire(Bool())
   insert_context := false.B // default
-  val app_idle = Wire(Bool())
-  app_idle := false.B
+  val start_timer = Wire(Bool())
+  start_timer := false.B // default
+  val msg_done = Wire(Bool())
+  msg_done := false.B
 
   if (usingLNIC) {
     // Connect rxQueues IO
@@ -432,7 +434,8 @@ class CSRFile(
     rxQueues.get.io.cur_context := reg_lcurcontext.get
     rxQueues.get.io.cur_priority := reg_lcurpriority.get
     rxQueues.get.io.insert := insert_context
-    rxQueues.get.io.idle := app_idle
+    rxQueues.get.io.start_timer := start_timer
+    rxQueues.get.io.msg_done := msg_done
     // update target context / priority CSRs
     reg_ltargetcontext.get := rxQueues.get.io.top_context
     reg_ltargetpriority.get := rxQueues.get.io.top_priority
@@ -605,7 +608,7 @@ class CSRFile(
     read_mapping += CSRs.lniccmd -> 0.U
     read_mapping += CSRs.ltargetcontext -> reg_ltargetcontext.get
     read_mapping += CSRs.ltargetpriority -> reg_ltargetpriority.get
-    read_mapping += CSRs.lidle -> 0.U
+    read_mapping += CSRs.lmsgdone -> 0.U
   }
 
   val pmpCfgPerCSR = xLen / new PMPConfig().getWidth
@@ -857,9 +860,10 @@ class CSRFile(
       }
       when (decoded_addr(CSRs.lniccmd)) {
         insert_context := wdata(0).asBool
+        start_timer := wdata(2).asBool
       }
-      when (decoded_addr(CSRs.lidle)) {
-        app_idle := wdata(0).asBool
+      when (decoded_addr(CSRs.lmsgdone)) {
+        msg_done := wdata(0).asBool
       }
     }
 

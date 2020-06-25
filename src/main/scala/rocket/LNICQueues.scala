@@ -116,8 +116,11 @@ class LNICTxQueue(implicit p: Parameters) extends Module {
  *     then generate an interrupt and update top_context and top_priority output signals
  *   - Dequeue words from the FIFO indicated by the current_context input signal
  *     - Remember that last 2 words that were dequeued for this context in case we need to roll back on pipeline flush
- *   - If the current_context_idle signal is asserted and top_context =/= current_context then generate an interrupt
- *   - Insert / remove the current context when told to do so
+ *   - msg_done signal is asserted when the current thread finishes processing a msg.
+ *   - msgs for threads at the same priority are processed in FIFO order
+ *   - Priority 0 is for gauanteed service apps. This module will track msg processing time for these apps.
+ *     - If the msg processing time exceeds Xus (e.g. 1us) then this module will reduce priority and schedule a higher
+ *       priority active thread if there is one. 
  */
 class LNICRxQueuesIO(val num_entries: Int) extends Bundle {
   val net_in = Flipped(Decoupled(new StreamChannel(XLEN)))
@@ -128,8 +131,11 @@ class LNICRxQueuesIO(val num_entries: Int) extends Bundle {
   val cur_priority = Input(UInt(width = LNIC_PRIORITY_BITS))
   val insert = Input(Bool())
   // val remove = Input(Bool()) // we won't support remove for now since it would involve clearing the FIFO
-  val idle = Input(Bool())
+  val start_timer = Input(Bool()) // asserted at the end of a context switch
 
+  val msg_done = Input(Bool())
+
+  // top_context and top_priority correspond to the highest priority active context and its priority, respectively
   val top_context = Output(UInt(width = LNIC_CONTEXT_BITS))
   val top_priority = Output(UInt(width = LNIC_PRIORITY_BITS))
   val interrupt = Output(Bool())
@@ -143,6 +149,7 @@ class LNICRxQueuesIO(val num_entries: Int) extends Bundle {
 
 class FIFOWord(val ptrBits: Int) extends Bundle {
   val word = UInt(width = XLEN)
+  val timestamp = UInt(64.W) // time at which the first word of the msg arrived, measured in cycles
   val next = UInt(width = ptrBits)
 
   override def cloneType = new FIFOWord(ptrBits).asInstanceOf[this.type]
@@ -200,9 +207,19 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   val cur_tail_entry = Wire(new TailTableEntry(ptrBits))
   val new_tail_entry = Wire(new TailTableEntry(ptrBits))
 
-  // create regs to store count for each context
+  // create regs to store state for each context
   val counts = RegInit(VecInit(Seq.fill(num_contexts)(0.U(log2Ceil(max_qsize + 1).W))))
   val priorities = RegInit(VecInit(Seq.fill(num_contexts)(0.U(LNIC_PRIORITY_BITS.W))))
+  // each context is either idle of active.
+  //   active means the context is either currently processing a msg or has msgs to process
+  val sIdle :: sActive :: Nil = Enum(2)
+  val ctx_state = RegInit(VecInit(Seq.fill(num_contexts)(sIdle)))
+  // regs to store the timestamp of the head msg for each context (updated on msg_done)
+  val ctx_timestamp = RegInit(VecInit(Seq.fill(num_contexts)(0.U(64.W))))
+
+  // timer used to timestamp enqueued msgs
+  val enq_timer = RegInit(0.U(64.W))
+  enq_timer := enq_timer + 1.U
 
   val cur_index = io.cur_context
   val enq_index = Wire(UInt())
@@ -253,6 +270,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
     // State machine to perform enqueue operations
     val sStart :: sEnqueue :: Nil = Enum(2)
     val enqState = RegInit(sStart)
+    val enq_timestamp = RegInit(0.U(64.W))
 
     val reg_enq_index = RegInit(0.U(LNIC_CONTEXT_BITS.W))
 
@@ -263,7 +281,8 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
       is (sStart) {
         when (io.net_in.valid && io.net_in.ready) {
           // there is enough room, enqueue the msg
-          perform_enq(enq_index)
+          perform_enq(enq_index, enq_timer)
+          enq_timestamp := enq_timer
           reg_enq_index := enq_index
           enqState := sEnqueue
         }
@@ -271,7 +290,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
       is (sEnqueue) {
         enq_index := reg_enq_index
         when (io.net_in.valid && io.net_in.ready) {
-          perform_enq(enq_index)
+          perform_enq(enq_index, enq_timestamp)
           when (io.net_in.bits.last) {
             enqState := sStart
           }
@@ -316,72 +335,123 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
     }
   }
 
-  // Update top_context and top_priority every time a word is enqueued, dequeued, or there is an unread operation.
+  // Update context state:
+  //   - Transition to idle when msg_done is asserted and there are no msgs for the context
+  //   - Transition to active when a msg arrives (may already be active)
+  when (io.msg_done && counts(cur_index) === 0.U) {
+    ctx_state(cur_index) := sIdle
+  }
+  when (do_enq) {
+    ctx_state(enq_index) := sActive
+  }
+  
+  // Update top_context and top_priority
+  // Compute the highest priority active context with the smallest msg timestamp
 
   val reg_top_priority = RegInit(0.U(LNIC_PRIORITY_BITS.W))
   val reg_top_context = RegInit(0.U(LNIC_CONTEXT_BITS.W))
 
-  val reg_do_enq = Reg(next = do_enq)
-  val reg_do_deq = Reg(next = do_deq)
-  val reg_do_unread = Reg(next = io.unread.valid)
-
-  // Update top_priority & top_context on enq/deq/unread operations
-  // Do this on the cycle after enq/deq/unread so that counts is updated
-  when (reg_do_enq || reg_do_deq || reg_do_unread) {
-    // Collect all context IDs (indicies) with count > 0 then select the one with the highest priority
-
-    val context_ids = Wire(Vec(num_contexts, UInt(width = LNIC_CONTEXT_BITS)))
-    for (i <- 0 until context_ids.size) {
-      context_ids(i) := i.U
-    }
-    val result = priorities.zip(context_ids).reduce( (tuple1, tuple2) => {
-      // tuple._1 = priority, tuple._2 = index (context)
-      val top_prio = Wire(UInt())
-      val top_context = Wire(UInt())
-      when (counts(tuple1._2) > 0.U && counts(tuple2._2) > 0.U) {
-        when (tuple1._1 < tuple2._1) {
-          top_prio := tuple1._1
-          top_context := tuple1._2
-        } .otherwise {
-          top_prio := tuple2._1
-          top_context := tuple2._2
-        }
-      } .elsewhen (counts(tuple1._2) > 0.U) {
-        top_prio := tuple1._1
-        top_context := tuple1._2
-      } .elsewhen (counts(tuple2._2) > 0.U) {
-        top_prio := tuple2._1
-        top_context := tuple2._2
-      } .otherwise {
-        top_prio := io.cur_priority
-        top_context := io.cur_context
-      }
-      (top_prio, top_context)
-    })
-
-    reg_top_priority := result._1
-    reg_top_context := result._2
+  // Wire up timestamp of the head msg for each context
+  // NOTE: this forces the tables / queues to be mapped to registers. Hopefully this still meets timing.
+  val context_timestamps = Wire(Vec(num_contexts, UInt(64.W)))
+  for (i <- 0 until num_contexts) {
+    val head = Wire(new RxHeadTableEntry(ptrBits))
+    head := head_table(i)
+    // read the head word from the RAM
+    val fifo_word = Wire(new FIFOWord(ptrBits))
+    fifo_word := ram(head.head)
+    // NOTE: if the queue for this context is empty then use max value for timestamp
+    context_timestamps(i) := Mux(counts(i) > 0.U, fifo_word.timestamp, ~0.U(64.W))
   }
+
+  val context_ids = Wire(Vec(num_contexts, UInt(width = LNIC_CONTEXT_BITS)))
+  for (i <- 0 until context_ids.size) {
+    context_ids(i) := i.U
+  }
+  val result = priorities.zip(context_ids).reduce( (tuple1, tuple2) => {
+    // tuple._1 = priority, tuple._2 = index (context)
+    val prio1 = tuple1._1
+    val ctx1 = tuple1._2
+    val prio2 = tuple2._1
+    val ctx2 = tuple2._2
+    val top_prio = Wire(UInt())
+    val top_context = Wire(UInt())
+    when (ctx_state(ctx1) === sActive && ctx_state(ctx2) === sActive) {
+      when (prio1 < prio2) {
+        top_prio := prio1
+        top_context := ctx1
+      } .elsewhen(prio2 < prio1) {
+        top_prio := prio2
+        top_context := ctx2
+      } .otherwise {
+        // Break ties using timestamp of head msg
+        when (context_timestamps(ctx1) < context_timestamps(ctx2)) {
+          top_prio := prio1
+          top_context := ctx1
+        } .otherwise {
+          top_prio := prio2
+          top_context := ctx2
+        }
+      }
+    } .elsewhen (ctx_state(ctx1) === sActive) {
+      top_prio := prio1
+      top_context := ctx1
+    } .elsewhen (ctx_state(ctx2) === sActive) {
+      top_prio := prio2
+      top_context := ctx2
+    } .otherwise {
+      top_prio := io.cur_priority
+      top_context := io.cur_context
+    }
+    (top_prio, top_context)
+  })
+
+  reg_top_priority := result._1
+  reg_top_context := result._2
 
   io.top_priority := reg_top_priority
   io.top_context := reg_top_context
 
+  // Timer to track msg processing time
+  val msg_timer = RegInit(0.U(64.W))
+
+  // Timer is restarted whenever:
+  //   (1) application asserts msg_done - in a real implementation, this module should
+  //       check to make sure a msg is actually processed before asserting msg_done
+  //   (2) nanokernel asserts start_timer at the end of a context switch
+  when (io.msg_done || io.start_timer) {
+    msg_timer := 0.U
+  } .otherwise {
+    msg_timer := msg_timer + 1.U
+  } 
+
   // Generate an interrupt whenever:
-  //   (1) an enqueue operation causes top_context =/= cur_context
-  //   (2) io.idle is asserted and top_context =/= cur_context
+  //   (1) an enqueue operation causes top_priority =/= cur_priority -- priority constraint
+  //   (2) msg_done is asserted and top_context =/= cur_context -- FIFO ordering constraint & work conserving constraint
+  //   (3) msg_timer expires, cur_priority === 0, cur_context is active,
+  //       and top_context =/= cur_context (also lower priority of cur_context) -- bounded processing time constraint
 
   // default - do not fire interrupt
   io.interrupt := false.B
 
-  val reg_reg_do_enq = Reg(next = reg_do_enq)
-  val reg_idle = Reg(next = io.idle) // register io.idle to break combinational loop
-  when (reg_reg_do_enq && (reg_top_context =/= io.cur_context)) {
+  val reg_do_enq = Reg(next = do_enq)
+  val reg_reg_do_enq = Reg(next = reg_do_enq) // wait for do_enq to update reg_top_context and reg_top_priority
+  val reg_msg_done = Reg(next = io.msg_done)
+  val reg_reg_msg_done = Reg(next = reg_msg_done) // wait for msg_done to update reg_top_context and reg_top_priority
+  when (reg_reg_do_enq && (reg_top_priority < priorities(io.cur_context))) {
+    assert(io.cur_context =/= reg_top_context, "Priorities don't match, but context IDs do?")
     io.interrupt := true.B
-  } .elsewhen (reg_idle && (reg_top_context =/= io.cur_context)) {
+  } .elsewhen (reg_reg_msg_done && (reg_top_context =/= io.cur_context)) {
     io.interrupt := true.B
+  } .elsewhen ( (msg_timer >= MSG_PROC_MAX_CYCLES.U) && (priorities(io.cur_context) === 0.U) &&
+                (ctx_state(io.cur_context) === sActive) && (reg_top_context =/= io.cur_context)) {
+    io.interrupt := true.B
+    // lower priority of this context because it violated msg processing time limit
+    priorities(io.cur_context) := 1.U
+    msg_timer := 0.U // reset timer
   }
 
-  def perform_enq(index: UInt) = {
+  def perform_enq(index: UInt, timestamp: UInt) = {
     do_enq := true.B
     // lookup current tail_ptr for this context
     cur_tail_entry := tail_table(index)
@@ -396,6 +466,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
     // write new word to RAM
     val enq_fifo_word = Wire(new FIFOWord(ptrBits))
     enq_fifo_word.word := io.net_in.bits.data
+    enq_fifo_word.timestamp := timestamp
     enq_fifo_word.next := tail_ptr_next
     ram(tail_ptr) := enq_fifo_word
 

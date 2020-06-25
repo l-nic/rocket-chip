@@ -17,6 +17,8 @@ object LNICRocketConsts {
   val MSG_LEN_BITS = 16
   val MAX_NUM_CONTEXTS = 2
   val MAX_MSG_SIZE_BYTES = 8192
+  // TODO(sibanez): how best to set this?
+  val MSG_PROC_MAX_CYCLES = 3000
 }
 
 case class LNICRocketParams(

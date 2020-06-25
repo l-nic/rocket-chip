@@ -731,7 +731,7 @@ object CSRs {
   val lcurcontext = 0x053
   val lniccmd = 0x054
   val lcurpriority = 0x055
-  val lidle = 0x056
+  val lmsgdone = 0x056
   val ltargetcontext = 0x058
   val ltargetpriority = 0x059
 
@@ -995,7 +995,7 @@ object CSRs {
     res += lcurcontext
     res += lniccmd
     res += lcurpriority
-    res += lidle
+    res += lmsgdone
     res += ltargetcontext
     res += ltargetpriority
 
