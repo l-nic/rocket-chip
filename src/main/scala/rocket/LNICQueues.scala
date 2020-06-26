@@ -428,7 +428,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   // Generate an interrupt whenever:
   //   (1) an enqueue operation causes top_priority =/= cur_priority -- priority constraint
   //   (2) msg_done is asserted and top_context =/= cur_context -- FIFO ordering constraint & work conserving constraint
-  //   (3) msg_timer expires, cur_priority === 0, cur_context is active,
+  //   (3) msg_timer expires, cur_priority === 0, cur_context is active (do I need this condition?),
   //       and top_context =/= cur_context (also lower priority of cur_context) -- bounded processing time constraint
 
   // default - do not fire interrupt
@@ -438,13 +438,13 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   val reg_reg_do_enq = Reg(next = reg_do_enq) // wait for do_enq to update reg_top_context and reg_top_priority
   val reg_msg_done = Reg(next = io.msg_done)
   val reg_reg_msg_done = Reg(next = reg_msg_done) // wait for msg_done to update reg_top_context and reg_top_priority
-  when (reg_reg_do_enq && (reg_top_priority < priorities(io.cur_context))) {
+  when (reg_reg_do_enq && (reg_top_priority < io.cur_priority)) {
     assert(io.cur_context =/= reg_top_context, "Priorities don't match, but context IDs do?")
     io.interrupt := true.B
   } .elsewhen (reg_reg_msg_done && (reg_top_context =/= io.cur_context)) {
     io.interrupt := true.B
-  } .elsewhen ( (msg_timer >= MSG_PROC_MAX_CYCLES.U) && (priorities(io.cur_context) === 0.U) &&
-                (ctx_state(io.cur_context) === sActive) && (reg_top_context =/= io.cur_context)) {
+  } .elsewhen ( (msg_timer >= MSG_PROC_MAX_CYCLES.U) && (io.cur_priority === 0.U) &&
+                (reg_top_context =/= io.cur_context)) {
     io.interrupt := true.B
     // lower priority of this context because it violated msg processing time limit
     priorities(io.cur_context) := 1.U
