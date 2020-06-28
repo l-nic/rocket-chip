@@ -51,6 +51,18 @@ class StreamIO(w: Int) extends Bundle {
   override def cloneType = new StreamIO(w).asInstanceOf[this.type]
 }
 
+class StreamIOvonly(w: Int) extends Bundle {
+  val in = Flipped(Valid(new StreamChannel(w)))
+  val out = Valid(new StreamChannel(w))
+
+  def flipConnect(other: StreamIOvonly) {
+    in <> other.out
+    other.in <> out
+  }
+
+  override def cloneType = new StreamIOvonly(w).asInstanceOf[this.type]
+}
+
 object NetworkHelpers {
   def reverse_bytes(a: UInt, n: Int) = {
     val bytes = (0 until n).map(i => a((i + 1) * 8 - 1, i * 8))
