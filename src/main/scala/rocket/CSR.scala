@@ -425,9 +425,17 @@ class CSRFile(
   start_timer := false.B // default
   val msg_done = Wire(Bool())
   msg_done := false.B
+  val app_idle = Wire(Bool())
+  app_idle := false.B
+
+  val add_context = Wire(Valid(UInt(LNICRocketConsts.LNIC_CONTEXT_BITS.W)))
 
   if (usingLNIC) {
+    add_context.valid := insert_context
+    add_context.bits := reg_lcurcontext.get
+    io.net.get.add_context := add_context
     // Connect rxQueues IO
+    io.net.get.get_next_msg := rxQueues.get.io.get_next_msg
     rxQueues.get.io.net_in <> io.net.get.net_in
     rxQueues.get.io.meta_in <> io.net.get.meta_in
     rxQueue_out.get <> rxQueues.get.io.net_out
@@ -436,6 +444,7 @@ class CSRFile(
     rxQueues.get.io.insert := insert_context
     rxQueues.get.io.start_timer := start_timer
     rxQueues.get.io.msg_done := msg_done
+    rxQueues.get.io.idle := app_idle
     // update target context / priority CSRs
     reg_ltargetcontext.get := rxQueues.get.io.top_context
     reg_ltargetpriority.get := rxQueues.get.io.top_priority
@@ -608,7 +617,7 @@ class CSRFile(
     read_mapping += CSRs.lniccmd -> 0.U
     read_mapping += CSRs.ltargetcontext -> reg_ltargetcontext.get
     read_mapping += CSRs.ltargetpriority -> reg_ltargetpriority.get
-    read_mapping += CSRs.lmsgdone -> 0.U
+    read_mapping += CSRs.lnicucmd -> 0.U
   }
 
   val pmpCfgPerCSR = xLen / new PMPConfig().getWidth
@@ -862,8 +871,9 @@ class CSRFile(
         insert_context := wdata(0).asBool
         start_timer := wdata(2).asBool
       }
-      when (decoded_addr(CSRs.lmsgdone)) {
+      when (decoded_addr(CSRs.lnicucmd)) {
         msg_done := wdata(0).asBool
+        app_idle := wdata(1).asBool
       }
     }
 

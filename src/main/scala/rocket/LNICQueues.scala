@@ -23,6 +23,9 @@ class CoreLNICIO extends Bundle {
   val net_in = Flipped(Decoupled(new StreamChannel(XLEN)))
   val meta_in = Flipped(Valid(new LNICRxMsgMeta))
   val net_out = Decoupled(new LNICTxMsgWord)
+  // Out-of-band coordination with NIC for load balancing
+  val add_context = Valid(UInt(LNIC_CONTEXT_BITS.W))
+  val get_next_msg = Valid(UInt(LNIC_CONTEXT_BITS.W))
 }
 
 class LNICTxMsgWord extends Bundle {
@@ -133,7 +136,10 @@ class LNICRxQueuesIO(val num_entries: Int) extends Bundle {
   // val remove = Input(Bool()) // we won't support remove for now since it would involve clearing the FIFO
   val start_timer = Input(Bool()) // asserted at the end of a context switch
 
+  // application indicates that msg processing is complete
   val msg_done = Input(Bool())
+  // app indicates that it is idle (set during polling loop)
+  val idle = Input(Bool())
 
   // top_context and top_priority correspond to the highest priority active context and its priority, respectively
   val top_context = Output(UInt(width = LNIC_CONTEXT_BITS))
@@ -144,15 +150,18 @@ class LNICRxQueuesIO(val num_entries: Int) extends Bundle {
   val count = Output(UInt(log2Ceil(num_entries + 1).W))
   val unread = Flipped(Valid(UInt(width = 2)))
 
+  // Indicate that the NIC should transmit another msg to this core
+  val get_next_msg = Valid(UInt(width = LNIC_CONTEXT_BITS))
+
   override def cloneType = new LNICRxQueuesIO(num_entries).asInstanceOf[this.type]
 }
 
-class FIFOWord(val ptrBits: Int) extends Bundle {
-  val word = UInt(width = XLEN)
-  val timestamp = UInt(64.W) // time at which the first word of the msg arrived, measured in cycles
+class TsFIFOWord(val wordBits: Int, val ptrBits: Int) extends Bundle {
+  val word = UInt(width = wordBits)
   val next = UInt(width = ptrBits)
+  val timestamp = UInt(64.W) // time at which the first word of the msg arrived, measured in cycles
 
-  override def cloneType = new FIFOWord(ptrBits).asInstanceOf[this.type]
+  override def cloneType = new TsFIFOWord(wordBits, ptrBits).asInstanceOf[this.type]
 }
 
 class HeadTableEntry(val ptrBits: Int) extends Bundle {
@@ -182,7 +191,7 @@ class RxHeadTableEntry(ptrBits: Int) extends HeadTableEntry(ptrBits) {
 @chiselName
 class LNICRxQueues(implicit p: Parameters) extends Module {
   val num_contexts = p(LNICRocketKey).get.maxNumContexts
-  val num_entries = (MAX_MSG_SIZE_BYTES/XBYTES)*num_contexts
+  val num_entries = (MAX_MSG_SIZE_BYTES/XBYTES)*num_contexts*MAX_OUTSTANDING_MSGS
 
   val io = IO(new LNICRxQueuesIO(num_entries))
 
@@ -192,7 +201,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
 
   val ptrBits = log2Ceil(num_entries)
   // create memory used to store msg words
-  val ram = Mem(num_entries, new FIFOWord(ptrBits))
+  val ram = Mem(num_entries, new TsFIFOWord(XLEN, ptrBits))
   // create free list for msg words
   val entries = for (i <- 0 until num_entries) yield i.U(log2Up(num_entries).W)
   val freelist = Module(new FreeList(entries))
@@ -229,6 +238,16 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   val do_deq = Wire(Bool())
   do_enq := false.B
   do_deq := false.B
+
+  val get_next_msg = Reg(Valid(UInt(width = LNIC_CONTEXT_BITS)))
+  when (reset.toBool) {
+    get_next_msg.valid := false.B
+    get_next_msg.bits := 0.U
+  } .otherwise {
+    get_next_msg.valid := io.msg_done
+    get_next_msg.bits := io.cur_context
+  }
+  io.get_next_msg := get_next_msg
 
   // defaults
   // do not enq or deq from the free list
@@ -336,9 +355,9 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   }
 
   // Update context state:
-  //   - Transition to idle when msg_done is asserted and there are no msgs for the context
+  //   - Transition to idle when msg_done or idle is asserted and there are no msgs for the context
   //   - Transition to active when a msg arrives (may already be active)
-  when (io.msg_done && counts(cur_index) === 0.U) {
+  when ( (io.msg_done || io.idle) && counts(cur_index) === 0.U) {
     ctx_state(cur_index) := sIdle
   }
   when (do_enq) {
@@ -358,7 +377,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
     val head = Wire(new RxHeadTableEntry(ptrBits))
     head := head_table(i)
     // read the head word from the RAM
-    val fifo_word = Wire(new FIFOWord(ptrBits))
+    val fifo_word = Wire(new TsFIFOWord(XLEN, ptrBits))
     fifo_word := ram(head.head)
     // NOTE: if the queue for this context is empty then use max value for timestamp
     context_timestamps(i) := Mux(counts(i) > 0.U, fifo_word.timestamp, ~0.U(64.W))
@@ -419,7 +438,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   //   (1) application asserts msg_done - in a real implementation, this module should
   //       check to make sure a msg is actually processed before asserting msg_done
   //   (2) nanokernel asserts start_timer at the end of a context switch
-  when (io.msg_done || io.start_timer) {
+  when (io.msg_done || io.idle || io.start_timer) {
     msg_timer := 0.U
   } .otherwise {
     msg_timer := msg_timer + 1.U
@@ -435,7 +454,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
 
   // Generate an interrupt whenever:
   //   (1) an enqueue operation causes top_priority =/= cur_priority -- priority constraint
-  //   (2) msg_done is asserted and top_context =/= cur_context -- FIFO ordering constraint & work conserving constraint
+  //   (2) msg_done or idle is asserted and top_context =/= cur_context -- FIFO ordering constraint & work conserving constraint
   //   (3) msg_timer expires, cur_priority === 0, cur_context is active (do I need this condition?),
   //       and top_context =/= cur_context (also lower priority of cur_context) -- bounded processing time constraint
 
@@ -444,13 +463,15 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
 
   val reg_do_enq = Reg(next = do_enq)
   val reg_reg_do_enq = Reg(next = reg_do_enq) // wait for do_enq to update reg_top_context and reg_top_priority
-  val reg_msg_done = Reg(next = io.msg_done)
-  val reg_reg_msg_done = Reg(next = reg_msg_done) // wait for msg_done to update reg_top_context and reg_top_priority
+  val check = Wire(Bool())
+  check := io.msg_done || io.idle
+  val reg_check = Reg(next = check)
+  val reg_reg_check = Reg(next = reg_check) // wait for msg_done/idle to update reg_top_context and reg_top_priority
   val reg_priority_lowered = Reg(next = priority_lowered)
   when (reg_reg_do_enq && (reg_top_priority < io.cur_priority)) {
     assert(io.cur_context =/= reg_top_context, "Priorities don't match, but context IDs do?")
     io.interrupt := true.B
-  } .elsewhen (reg_reg_msg_done && (reg_top_context =/= io.cur_context)) {
+  } .elsewhen (reg_reg_check && (reg_top_context =/= io.cur_context)) {
     io.interrupt := true.B
   } .elsewhen (reg_priority_lowered && (reg_top_context =/= io.cur_context)) {
     io.interrupt := true.B
@@ -470,7 +491,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
     assert (freelist.io.deq.valid, "Free list is empty during msg enqueue!")
 
     // write new word to RAM
-    val enq_fifo_word = Wire(new FIFOWord(ptrBits))
+    val enq_fifo_word = Wire(new TsFIFOWord(XLEN, ptrBits))
     enq_fifo_word.word := io.net_in.bits.data
     enq_fifo_word.timestamp := timestamp
     enq_fifo_word.next := tail_ptr_next
@@ -490,7 +511,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
     assert (cur_head_entry.valid, "Attempting to perform dequeue for an invalid contextID")
 
     // read the head word from the RAM
-    val deq_fifo_word = Wire(new FIFOWord(ptrBits))
+    val deq_fifo_word = Wire(new TsFIFOWord(XLEN, ptrBits))
     deq_fifo_word := ram(head_ptr)
     io.net_out.bits := deq_fifo_word.word
     val head_ptr_next = deq_fifo_word.next

@@ -729,9 +729,16 @@ object CSRs {
   // LNIC CSRs
   val lmsgsrdy = 0x052
   val lcurcontext = 0x053
+  // lniccmd is used by the nanokernel to send cmds to the LNIC
+  //   bit-0: insert context
+  //   bit-1: remove context (TODO)
+  //   bit-2: start timer
   val lniccmd = 0x054
   val lcurpriority = 0x055
-  val lmsgdone = 0x056
+  // lnicucmd us used by apps to send cmds to the LNIC
+  //   bit-0: msg processing complete
+  //   bit-1: application is idle
+  val lnicucmd = 0x056
   val ltargetcontext = 0x058
   val ltargetpriority = 0x059
 
@@ -995,7 +1002,7 @@ object CSRs {
     res += lcurcontext
     res += lniccmd
     res += lcurpriority
-    res += lmsgdone
+    res += lnicucmd
     res += ltargetcontext
     res += ltargetpriority
 
