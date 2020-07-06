@@ -47,9 +47,14 @@ NetworkSwitch::NetworkSwitch(const char *ifname)
     }
 
     fd = tuntap_alloc(ifname, IFF_TAP | IFF_NO_PI);
+    fprintf(stderr, "ifname: %s\n", ifname);
     if (fd < 0) {
         fprintf(stderr, "Could not open tap interface\n");
-        abort();
+        fd = tuntap_alloc("tap1", IFF_TAP | IFF_NO_PI);
+        if (fd < 0) {
+            fprintf(stderr, "Still could not open tap interface\n");
+            abort();
+        }
     }
 
 skip_tuntap:
