@@ -284,6 +284,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     // Connect CSRFile network IO to RocketCore IO
     csr.io.net.get.net_in <> io.net.get.net_in
     csr.io.net.get.meta_in <> io.net.get.meta_in
+    csr.io.net.get.reset_done := io.net.get.reset_done
     io.net.get.net_out <> csr.io.net.get.net_out
     io.net.get.add_context := csr.io.net.get.add_context
     io.net.get.get_next_msg := csr.io.net.get.get_next_msg

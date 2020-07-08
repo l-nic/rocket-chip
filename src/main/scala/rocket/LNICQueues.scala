@@ -26,6 +26,7 @@ class CoreLNICIO extends Bundle {
   // Out-of-band coordination with NIC for load balancing
   val add_context = Valid(UInt(LNIC_CONTEXT_BITS.W))
   val get_next_msg = Valid(UInt(LNIC_CONTEXT_BITS.W))
+  val reset_done = Input(Bool())
 }
 
 class LNICTxMsgWord extends Bundle {

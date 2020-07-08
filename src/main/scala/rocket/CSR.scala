@@ -408,6 +408,7 @@ class CSRFile(
   val reg_vstart = usingVector.option(Reg(UInt(maxVLMax.log2.W)))
 
   // Define LNIC CSRs, Rx/Tx queues, and additional wires
+  val reg_lnicrdy = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
   val reg_lmsgsrdy = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
   val reg_lcurcontext = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
   val reg_lcurpriority = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
@@ -431,6 +432,7 @@ class CSRFile(
   val add_context = Wire(Valid(UInt(LNICRocketConsts.LNIC_CONTEXT_BITS.W)))
 
   if (usingLNIC) {
+    reg_lnicrdy.get := io.net.get.reset_done
     add_context.valid := insert_context
     add_context.bits := reg_lcurcontext.get
     io.net.get.add_context := add_context
@@ -611,6 +613,7 @@ class CSRFile(
   }
 
   if (usingLNIC) {
+    read_mapping += CSRs.lnicrdy -> reg_lnicrdy.get
     read_mapping += CSRs.lmsgsrdy -> reg_lmsgsrdy.get
     read_mapping += CSRs.lcurcontext -> reg_lcurcontext.get
     read_mapping += CSRs.lcurpriority -> reg_lcurpriority.get
