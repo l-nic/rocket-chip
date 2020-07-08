@@ -933,15 +933,16 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       printf ("x%d p%d 0x%x\n", rf_waddr, rf_waddr, rf_wdata)
     }
   }
-  else {
-    printf("C%d: %d [%d] pc=[%x] W[r%d=%x] R[r%d=%x] R[r%d=%x] inst=[%x] DASM(%x)\n",
-         io.hartid, coreMonitorBundle.timer, coreMonitorBundle.valid,
-         coreMonitorBundle.pc,
-         Mux(coreMonitorBundle.wren, coreMonitorBundle.wrdst, UInt(0)), coreMonitorBundle.wrdata,
-         coreMonitorBundle.rd0src, coreMonitorBundle.rd0val,
-         coreMonitorBundle.rd1src, coreMonitorBundle.rd1val,
-         coreMonitorBundle.inst, coreMonitorBundle.inst)
-  }
+// TODO(sibanez): disabled instruction printf at commit
+//  else {
+//    printf("C%d: %d [%d] pc=[%x] W[r%d=%x] R[r%d=%x] R[r%d=%x] inst=[%x] DASM(%x)\n",
+//         io.hartid, coreMonitorBundle.timer, coreMonitorBundle.valid,
+//         coreMonitorBundle.pc,
+//         Mux(coreMonitorBundle.wren, coreMonitorBundle.wrdst, UInt(0)), coreMonitorBundle.wrdata,
+//         coreMonitorBundle.rd0src, coreMonitorBundle.rd0val,
+//         coreMonitorBundle.rd1src, coreMonitorBundle.rd1val,
+//         coreMonitorBundle.inst, coreMonitorBundle.inst)
+//  }
 
   PlusArg.timeout(
     name = "max_core_cycles",
