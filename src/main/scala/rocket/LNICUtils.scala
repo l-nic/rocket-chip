@@ -15,7 +15,7 @@ object LNICRocketConsts {
   val LNIC_CONTEXT_BITS = 16
   val LNIC_PRIORITY_BITS = 8
   val MSG_LEN_BITS = 16
-  val MAX_NUM_CONTEXTS = 2
+  val MAX_NUM_CONTEXTS = 8
   val MAX_MSG_SIZE_BYTES = 8192
   // TODO(sibanez): how best to set this?
   val MSG_PROC_MAX_CYCLES = 3000
