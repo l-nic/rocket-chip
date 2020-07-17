@@ -470,7 +470,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   val reg_reg_check = Reg(next = reg_check) // wait for msg_done/idle to update reg_top_context and reg_top_priority
   val reg_priority_lowered = Reg(next = priority_lowered)
   when (reg_reg_do_enq && (reg_top_priority < io.cur_priority)) {
-    assert(io.cur_context =/= reg_top_context, "Priorities don't match, but context IDs do?")
+    // assert(io.cur_context =/= reg_top_context, "Priorities don't match, but context IDs do?")
     io.interrupt := true.B
   } .elsewhen (reg_reg_check && (reg_top_context =/= io.cur_context)) {
     io.interrupt := true.B
