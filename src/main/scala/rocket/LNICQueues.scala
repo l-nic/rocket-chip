@@ -3,7 +3,7 @@ package freechips.rocketchip.rocket
 
 import Chisel._
 
-import chisel3.{VecInit}
+import chisel3.{VecInit, dontTouch}
 import chisel3.experimental._
 import freechips.rocketchip.config.Parameters
 import freechips.rocketchip.tile._
@@ -65,6 +65,15 @@ class LNICTxQueue(implicit p: Parameters) extends Module {
 
   val tx_queue_enq = Wire(Decoupled(new LNICTxMsgWord))
   io.net_out <> Queue(tx_queue_enq, max_msg_words*num_contexts)
+
+  // keep track of tx queue size
+  val tx_queue_count = RegInit(0.U(log2Up(max_msg_words*num_contexts).W))
+  dontTouch(tx_queue_count)
+  when (tx_queue_enq.fire() && !io.net_out.fire()) {
+    tx_queue_count := tx_queue_count + 1.U
+  } .elsewhen(io.net_out.fire() && !tx_queue_enq.fire()) {
+    tx_queue_count := tx_queue_count - 1.U
+  }
 
   /* Enqueue state machine
    *   - Check if entire msg fits in the tx queue before writing the first word
