@@ -742,6 +742,8 @@ object CSRs {
   val lnicrdy = 0x057
   val ltargetcontext = 0x058
   val ltargetpriority = 0x059
+  val lmsgcycles = 0x060
+  val lidlecycles = 0x061
 
   val cycle = 0xc00
   val time = 0xc01
@@ -1007,6 +1009,8 @@ object CSRs {
     res += lnicrdy
     res += ltargetcontext
     res += ltargetpriority
+    res += lmsgcycles
+    res += lidlecycles
 
     res += cycle
     res += time

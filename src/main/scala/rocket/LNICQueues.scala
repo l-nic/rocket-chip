@@ -163,6 +163,10 @@ class LNICRxQueuesIO(val num_entries: Int) extends Bundle {
   // Indicate that the NIC should transmit another msg to this core
   val get_next_msg = Valid(UInt(width = LNIC_CONTEXT_BITS))
 
+  // set by CSRs
+  val msg_proc_max_cycles = Input(UInt(64.W))
+  val idle_timeout_cycles = Input(UInt(64.W))
+
   override def cloneType = new LNICRxQueuesIO(num_entries).asInstanceOf[this.type]
 }
 
@@ -226,6 +230,15 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   val cur_tail_entry = Wire(new TailTableEntry(ptrBits))
   val new_tail_entry = Wire(new TailTableEntry(ptrBits))
 
+  // Queue to store all the context IDs that have been added
+  val running_contexts_enq = Wire(Decoupled(UInt(LNIC_CONTEXT_BITS.W)))
+  val running_contexts_deq = Wire(Flipped(Decoupled(UInt(LNIC_CONTEXT_BITS.W))))
+  running_contexts_deq <> Queue(running_contexts_enq, num_contexts)
+  running_contexts_enq.valid := false.B // default
+  running_contexts_deq.ready := false.B // default
+
+  val num_running_contexts = RegInit(0.U(log2Up(num_contexts).W))
+
   // create regs to store state for each context
   val counts = RegInit(VecInit(Seq.fill(num_contexts)(0.U(log2Ceil(max_qsize + 1).W))))
   val priorities = RegInit(VecInit(Seq.fill(num_contexts)(0.U(LNIC_PRIORITY_BITS.W))))
@@ -236,7 +249,16 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   // regs to store the timestamp of the head msg for each context (updated on msg_done)
   val ctx_timestamp = RegInit(VecInit(Seq.fill(num_contexts)(0.U(64.W))))
 
-  // timer used to timestamp enqueued msgs
+  // Timer to track idle time of current context
+  val idle_timer = RegInit(0.U(64.W))
+  idle_timer := idle_timer + 1.U // default
+  val idle_timeout = Wire(Bool())
+  idle_timeout := false.B // default
+
+  // Timer to track msg processing time
+  val msg_timer = RegInit(0.U(64.W))
+
+  // Timer used to timestamp enqueued msgs
   val enq_timer = RegInit(0.U(64.W))
   enq_timer := enq_timer + 1.U
 
@@ -276,6 +298,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   //   when insert is asserted, insert the cur_context into the head/tail_tables
   //   and set count to 0
   when (io.insert) {
+    num_running_contexts := num_running_contexts + 1.U
     // do not perform an enqueue because we need to update tail_table
     io.net_in.ready := false.B
     // update head_table, try to read from free list
@@ -294,6 +317,10 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
     priorities(cur_index) := io.cur_priority
     // initialize count
     counts(cur_index) := 0.U
+    // add this context to the running contexts queue
+    running_contexts_enq.valid := true.B
+    running_contexts_enq.bits := io.cur_context
+    assert(running_contexts_enq.ready, "running_contexts queue is full during context insertion!")
   } .otherwise {
 
     // State machine to perform enqueue operations
@@ -362,6 +389,18 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
       val unread_inc = Mux(io.unread.valid && (cur_index === i.U), unread_cnt, 0.U)
       counts(i.U) := counts(i.U) + enq_inc - deq_dec + unread_inc
     }
+
+    // Logic to read from / write to running_contexts queue and fire idle_timeout events
+    when (idle_timer >= io.idle_timeout_cycles && ctx_state(io.cur_context) === sIdle && num_running_contexts > 1.U) {
+      idle_timeout := true.B
+      idle_timer := 0.U
+      running_contexts_enq.valid := true.B
+      running_contexts_enq.bits := running_contexts_deq.bits
+      running_contexts_deq.ready := true.B
+      assert(running_contexts_enq.ready, "running_contexts queue is full on idle_timeout!")
+      assert(running_contexts_deq.valid, "running_contexts queue is empty on idle_timeout!")
+    }
+
   }
 
   // Update context state:
@@ -369,9 +408,18 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   //   - Transition to active when a msg arrives (may already be active)
   when ( (io.msg_done || io.idle) && counts(cur_index) === 0.U) {
     ctx_state(cur_index) := sIdle
+    // restart idle_timer when context first transitions to idle state
+    when (ctx_state(cur_index) =/= sIdle) {
+      idle_timer := 0.U
+    }
   }
   when (do_enq) {
     ctx_state(enq_index) := sActive
+  }
+
+  // Update idle timer on boot and context switches
+  when (io.start_timer) {
+    idle_timer := 0.U
   }
   
   // Update top_context and top_priority
@@ -409,7 +457,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
       when (prio1 < prio2) {
         top_prio := prio1
         top_context := ctx1
-      } .elsewhen(prio2 < prio1) {
+      } .elsewhen (prio2 < prio1) {
         top_prio := prio2
         top_context := ctx2
       } .otherwise {
@@ -429,25 +477,33 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
       top_prio := prio2
       top_context := ctx2
     } .otherwise {
-      top_prio := io.cur_priority
+      top_prio := priorities(io.cur_context)
       top_context := io.cur_context
     }
     (top_prio, top_context)
   })
 
-  reg_top_priority := result._1
-  reg_top_context := result._2
+  val top_priority = result._1
+  val top_context = result._2
+
+  // Update the top_context and top_priority
+  when (ctx_state(top_context) === sActive) {
+    reg_top_priority := top_priority
+    reg_top_context := top_context
+  } .elsewhen (idle_timeout) {
+    reg_top_priority := priorities(running_contexts_deq.bits)
+    reg_top_context := running_contexts_deq.bits
+    assert(running_contexts_deq.valid, "running_contexts queue is empty on idle_timeout!")
+  }
 
   io.top_priority := reg_top_priority
   io.top_context := reg_top_context
 
-  // Timer to track msg processing time
-  val msg_timer = RegInit(0.U(64.W))
 
-  // Timer is restarted whenever:
+  // Message timer is restarted whenever:
   //   (1) application asserts msg_done - in a real implementation, this module should
   //       check to make sure a msg is actually processed before asserting msg_done
-  //   (2) nanokernel asserts start_timer at the end of a context switch
+  //   (2) nanokernel asserts start_timer at the end of a context switch or on boot
   when (io.msg_done || io.idle || io.start_timer) {
     msg_timer := 0.U
   } .otherwise {
@@ -457,7 +513,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   // lower priority of the current context if it exceeds msg processing time
   val priority_lowered = Wire(Bool())
   priority_lowered := false.B // default
-  when ((msg_timer >= MSG_PROC_MAX_CYCLES.U) && (io.cur_priority === 0.U)) {
+  when ((msg_timer >= io.msg_proc_max_cycles) && (priorities(io.cur_context) === 0.U)) {
     priority_lowered := true.B
     priorities(io.cur_context) := 1.U
   }
@@ -467,6 +523,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   //   (2) msg_done or idle is asserted and top_context =/= cur_context -- FIFO ordering constraint & work conserving constraint
   //   (3) msg_timer expires, cur_priority === 0, cur_context is active (do I need this condition?),
   //       and top_context =/= cur_context (also lower priority of cur_context) -- bounded processing time constraint
+  //   (4) current context has been idle for IDLE_TIMEOUT_CYCLES -- allow idle threads to make progress
 
   // default - do not fire interrupt
   io.interrupt := false.B
@@ -478,7 +535,8 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   val reg_check = Reg(next = check)
   val reg_reg_check = Reg(next = reg_check) // wait for msg_done/idle to update reg_top_context and reg_top_priority
   val reg_priority_lowered = Reg(next = priority_lowered)
-  when (reg_reg_do_enq && (reg_top_priority < io.cur_priority)) {
+  val reg_idle_timeout = Reg(next = idle_timeout)
+  when (reg_reg_do_enq && ((reg_top_priority < priorities(io.cur_context)) || (io.cur_context >= num_running_contexts))) {
     assert(io.cur_context =/= reg_top_context, "Priorities don't match, but context IDs do?")
     io.interrupt := true.B
   } .elsewhen (reg_reg_check && (reg_top_context =/= io.cur_context)) {
@@ -486,6 +544,8 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   } .elsewhen (reg_priority_lowered && (reg_top_context =/= io.cur_context)) {
     io.interrupt := true.B
     msg_timer := 0.U // reset timer
+  } .elsewhen (reg_idle_timeout && (reg_top_context =/= io.cur_context)) {
+    io.interrupt := true.B
   }
 
   def perform_enq(index: UInt, timestamp: UInt) = {

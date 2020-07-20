@@ -414,6 +414,8 @@ class CSRFile(
   val reg_lcurpriority = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
   val reg_ltargetcontext = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
   val reg_ltargetpriority = if (usingLNIC) Some(Reg(init = 0.asUInt(xLen.W))) else None
+  val reg_lmsgcycles = if (usingLNIC) Some(RegInit(LNICRocketConsts.MSG_PROC_MAX_CYCLES.U(xLen.W))) else None
+  val reg_lidlecycles = if (usingLNIC) Some(RegInit(LNICRocketConsts.IDLE_TIMEOUT_CYCLES.U(xLen.W))) else None
   // rxQueue must be able to support unread operations for pipeline flushes if using GPRs
   val rxQueues = if (usingLNIC) Some(Module(new LNICRxQueues)) else None
   val rxQueue_out = if (usingLNIC) Some(Wire(Flipped(Decoupled(UInt(width = xLen))))) else None
@@ -447,6 +449,8 @@ class CSRFile(
     rxQueues.get.io.start_timer := start_timer
     rxQueues.get.io.msg_done := msg_done
     rxQueues.get.io.idle := app_idle
+    rxQueues.get.io.msg_proc_max_cycles := reg_lmsgcycles.get
+    rxQueues.get.io.idle_timeout_cycles := reg_lidlecycles.get
     // update target context / priority CSRs
     reg_ltargetcontext.get := rxQueues.get.io.top_context
     reg_ltargetpriority.get := rxQueues.get.io.top_priority
@@ -454,7 +458,6 @@ class CSRFile(
     txQueues.get.io.net_in <> txQueue_in.get
     io.net.get.net_out <> txQueues.get.io.net_out
     txQueues.get.io.cur_context := reg_lcurcontext.get
-    //txQueues.get.io.insert := insert_context
 
     /* Wire up txQueue_in */
     txQueue_in.get.valid := io.tx.get.cmd.valid
@@ -621,6 +624,8 @@ class CSRFile(
     read_mapping += CSRs.ltargetcontext -> reg_ltargetcontext.get
     read_mapping += CSRs.ltargetpriority -> reg_ltargetpriority.get
     read_mapping += CSRs.lnicucmd -> 0.U
+    read_mapping += CSRs.lmsgcycles -> reg_lmsgcycles.get
+    read_mapping += CSRs.lidlecycles -> reg_lidlecycles.get
   }
 
   val pmpCfgPerCSR = xLen / new PMPConfig().getWidth
@@ -689,7 +694,7 @@ class CSRFile(
       io_dec.fp_csr && io_dec.fp_illegal
     io_dec.write_illegal := io_dec.csr(11,10).andR
     // Do not flush the pipeline on writes to LNIC CSRs
-    io_dec.write_flush := !(io_dec.csr >= CSRs.mscratch && io_dec.csr <= CSRs.mtval || io_dec.csr >= CSRs.sscratch && io_dec.csr <= CSRs.stval || (io_dec.csr >= CSRs.lmsgsrdy && io_dec.csr <= CSRs.ltargetpriority))
+    io_dec.write_flush := !(io_dec.csr >= CSRs.mscratch && io_dec.csr <= CSRs.mtval || io_dec.csr >= CSRs.sscratch && io_dec.csr <= CSRs.stval || (io_dec.csr >= CSRs.lmsgsrdy && io_dec.csr <= CSRs.lidlecycles))
     io_dec.system_illegal := reg_mstatus.prv < io_dec.csr(9,8) ||
       is_wfi && !allow_wfi ||
       is_ret && !allow_sret ||
@@ -877,6 +882,12 @@ class CSRFile(
       when (decoded_addr(CSRs.lnicucmd)) {
         msg_done := wdata(0).asBool
         app_idle := wdata(1).asBool
+      }
+      when (decoded_addr(CSRs.lmsgcycles)) {
+        reg_lmsgcycles.get := wdata
+      }
+      when(decoded_addr(CSRs.lidlecycles)) {
+        reg_lidlecycles.get := wdata
       }
     }
 

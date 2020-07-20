@@ -17,8 +17,8 @@ object LNICRocketConsts {
   val MSG_LEN_BITS = 16
   val MAX_NUM_CONTEXTS = 4
   val MAX_MSG_SIZE_BYTES = 2048
-  // TODO(sibanez): how best to set this?
-  val MSG_PROC_MAX_CYCLES = 3000
+  val MSG_PROC_MAX_CYCLES = 3000 // default CSR value
+  val IDLE_TIMEOUT_CYCLES = 3000 // default CSR value
   val MAX_OUTSTANDING_MSGS = 2
 }
 
