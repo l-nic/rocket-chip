@@ -513,7 +513,8 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   // lower priority of the current context if it exceeds msg processing time
   val priority_lowered = Wire(Bool())
   priority_lowered := false.B // default
-  when ((msg_timer >= io.msg_proc_max_cycles) && (priorities(io.cur_context) === 0.U)) {
+  // NOTE: the main nanokernel thread will use a context ID that is greater than the number of running threads
+  when ((msg_timer >= io.msg_proc_max_cycles) && (priorities(io.cur_context) === 0.U) && (io.cur_context < num_running_contexts)) {
     priority_lowered := true.B
     priorities(io.cur_context) := 1.U
   }
