@@ -514,7 +514,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   val priority_lowered = Wire(Bool())
   priority_lowered := false.B // default
   // NOTE: the main nanokernel thread will use a context ID that is greater than the number of running threads
-  when ((msg_timer >= io.msg_proc_max_cycles) && (priorities(io.cur_context) === 0.U) && (io.cur_context < num_running_contexts)) {
+  when ((msg_timer >= io.msg_proc_max_cycles) && (priorities(io.cur_context) === 0.U) && (io.cur_context =/= NANOKERNEL_CONTEXT)) {
     priority_lowered := true.B
     priorities(io.cur_context) := 1.U
   }
@@ -537,7 +537,7 @@ class LNICRxQueues(implicit p: Parameters) extends Module {
   val reg_reg_check = Reg(next = reg_check) // wait for msg_done/idle to update reg_top_context and reg_top_priority
   val reg_priority_lowered = Reg(next = priority_lowered)
   val reg_idle_timeout = Reg(next = idle_timeout)
-  when (reg_reg_do_enq && ((reg_top_priority < priorities(io.cur_context)) || (io.cur_context >= num_running_contexts))) {
+  when (reg_reg_do_enq && ((reg_top_priority < priorities(io.cur_context)) || (io.cur_context === NANOKERNEL_CONTEXT))) {
     assert(io.cur_context =/= reg_top_context, "Priorities don't match, but context IDs do?")
     io.interrupt := true.B
   } .elsewhen (reg_reg_check && (reg_top_context =/= io.cur_context)) {

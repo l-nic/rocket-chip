@@ -20,6 +20,7 @@ object LNICRocketConsts {
   val MSG_PROC_MAX_CYCLES = 3000 // default CSR value
   val IDLE_TIMEOUT_CYCLES = 3000 // default CSR value
   val MAX_OUTSTANDING_MSGS = 2
+  val NANOKERNEL_CONTEXT = "hffff".U(LNIC_CONTEXT_BITS.W)
 }
 
 case class LNICRocketParams(
