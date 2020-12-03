@@ -28,7 +28,7 @@ case class RocketCoreParams(
   nBreakpoints: Int = 1,
   useBPWatch: Boolean = false,
   nPMPs: Int = 8,
-  nPerfCounters: Int = 0,
+  nPerfCounters: Int = 1,
   haveBasicCounters: Boolean = true,
   haveCFlush: Boolean = false,
   misaWritable: Boolean = true,
